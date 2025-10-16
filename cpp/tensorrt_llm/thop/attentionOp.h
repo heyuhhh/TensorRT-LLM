@@ -63,6 +63,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
-    std::optional<int64_t> sparse_mla_topk);
+    std::optional<int64_t> sparse_mla_topk, int64_t const sparse_attn_indices_block_size);
 
 } // namespace torch_ext

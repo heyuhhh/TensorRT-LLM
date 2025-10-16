@@ -65,6 +65,7 @@ void initBindings(pybind11::module_& m)
         py::arg("spec_decoding_tensor_params"), py::arg("sparse_kv_indices") = std::nullopt,
         py::arg("sparse_kv_offsets") = std::nullopt, py::arg("sparse_attn_indices") = std::nullopt,
         py::arg("sparse_attn_offsets") = std::nullopt, py::arg("sparse_mla_topk") = std::nullopt,
+        py::arg("sparse_attn_indices_block_size"),
         "Multi-head attention operation", py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop
