@@ -33,13 +33,16 @@ struct SparseAttentionParams
     int32_t* sparse_kv_offsets{nullptr};   // [num_contexts + 1]
     int32_t* sparse_attn_offsets{nullptr}; // [num_generations + 1]
 
+    int32_t sparse_attn_indices_block_size{1};
+
     std::string toString() const
     {
         std::stringstream ss;
         ss << "sparse_kv_indices: " << this->sparse_kv_indices << std::endl
            << "sparse_attn_indices: " << this->sparse_attn_indices << std::endl
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
-           << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl;
+           << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
+           << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size << std::endl;
         return ss.str();
     }
 

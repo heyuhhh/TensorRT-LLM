@@ -200,6 +200,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return True
 
+    def get_indices_block_size(self) -> int:
+        return 1
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
@@ -221,6 +224,11 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        # TODO: support block size other than 1
+        # currently, the block size is always 1 for RocketKV
+        return 1
 
 
 class MoeConfig(StrictBaseModel):
