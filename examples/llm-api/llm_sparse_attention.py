@@ -64,7 +64,7 @@ def parse_arguments():
                         help="The prompt budget for RocketKV.")
     parser.add_argument("--max_seq_len",
                         type=int,
-                        default=8192,
+                        default=10240,
                         help="The maximum sequence length.")
     parser.add_argument("--max_batch_size",
                         type=int,
@@ -77,7 +77,7 @@ def parse_arguments():
     parser.add_argument(
         "--max_num_tokens",
         type=int,
-        default=8192,
+        default=81920,
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )

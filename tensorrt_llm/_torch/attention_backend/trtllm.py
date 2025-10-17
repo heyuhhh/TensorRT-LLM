@@ -1264,10 +1264,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         sparse_attn_indices_block_size = 1
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata)
-            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata)
+            sparse_kv_indices, sparse_kv_offsets = self.batch_sparse_kv_predict(
+                q, metadata)
+            sparse_attn_indices, sparse_attn_offsets = self.batch_sparse_attn_predict(
+                q, metadata)
             sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
             )
 
@@ -1538,15 +1538,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.v_head_dim,
         )
 
-    def sparse_attn_predict(
+    def batch_sparse_attn_predict(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
+        qkv: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse attn indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
+
+    def batch_sparse_kv_predict(
+        self,
+        qkv: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse kv indices. It's implemented in the derived class.
         """
         raise NotImplementedError
 
@@ -1559,5 +1569,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse kv indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse attn indices. It's implemented in the derived class.
         """
         raise NotImplementedError
