@@ -24,8 +24,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .kernel import (bmm, flatten_sparse_indices, fused_qk_split,
                      kt_cache_update_and_bmm, reshape_flatten_to_batched,
-                     triton_index_gather, triton_load_kt_cache,
-                     triton_reduce_scores_context,
+                     triton_index_gather, triton_reduce_scores_context,
                      triton_reduce_scores_generation, triton_softmax,
                      triton_topk, triton_update_kt_cache,
                      triton_update_kt_cache_ctx)
@@ -464,48 +463,57 @@ class RocketTrtllmAttention(TrtllmAttention):
             return None, None
 
         qkv_input = qkv[:num_ctx_tokens]
-        q_window, k_context = fused_qk_split(qkv_input, self.num_heads,
-                                             self.num_kv_heads, self.head_dim,
-                                             self.window_size,
-                                             self.prompt_budget, metadata)
 
-        scores = bmm(q_window,
-                     k_context,
-                     metadata.q_cu_seqlens_cuda,
-                     metadata.k_cu_seqlens_cuda,
-                     metadata.valid_batch_size,
-                     causal=False)
+        if metadata.valid_batch_size > 0:
+            q_window, k_context = fused_qk_split(qkv_input, self.num_heads,
+                                                 self.num_kv_heads,
+                                                 self.head_dim,
+                                                 self.window_size,
+                                                 self.prompt_budget, metadata)
 
-        scores = triton_softmax(scores, metadata.k_cu_seqlens_cuda,
-                                metadata.valid_batch_size)
+            scores = bmm(q_window,
+                         k_context,
+                         metadata.q_cu_seqlens_cuda,
+                         metadata.k_cu_seqlens_cuda,
+                         metadata.valid_batch_size,
+                         causal=False)
 
-        # Sum over q_len_per_seq (window_size) and num_heads_per_kv for each batch separately
-        scores = triton_reduce_scores_context(
-            scores,
-            metadata.q_cu_seqlens_cuda,
-            metadata.k_cu_seqlens_cuda,
-            metadata.valid_batch_size,
-            self.num_kv_heads,
-            self.num_heads // self.num_kv_heads,
-            self.window_size,
-        )
+            scores = triton_softmax(scores, metadata.k_cu_seqlens_cuda,
+                                    metadata.valid_batch_size)
 
-        # Reshape scores to handle variable length sequences with padding using Triton
-        # scores: [num_kv_heads, total_k_tokens] -> [valid_batch_size, num_kv_heads, padding_size]
-        scores = reshape_flatten_to_batched(scores,
-                                            metadata.k_context_lens_cuda,
-                                            metadata.k_cu_seqlens_cuda,
-                                            metadata.valid_batch_size,
-                                            metadata.max_k_context_tokens)
+            # Sum over q_len_per_seq (window_size) and num_heads_per_kv for each batch separately
+            scores = triton_reduce_scores_context(
+                scores,
+                metadata.q_cu_seqlens_cuda,
+                metadata.k_cu_seqlens_cuda,
+                metadata.valid_batch_size,
+                self.num_kv_heads,
+                self.num_heads // self.num_kv_heads,
+                self.window_size,
+            )
 
-        scores = torch.nn.functional.max_pool1d(scores,
-                                                kernel_size=self.kernel_size,
-                                                padding=self.kernel_size // 2,
-                                                stride=1)
+            # Reshape scores to handle variable length sequences with padding using Triton
+            # scores: [num_kv_heads, total_k_tokens] -> [valid_batch_size, num_kv_heads, padding_size]
+            scores = reshape_flatten_to_batched(scores,
+                                                metadata.k_context_lens_cuda,
+                                                metadata.k_cu_seqlens_cuda,
+                                                metadata.valid_batch_size,
+                                                metadata.max_k_context_tokens)
 
-        selected_prefix_indices = scores.topk(
-            self.prompt_budget - self.window_size,
-            dim=-1).indices.sort().values.to(torch.int32)
+            scores = torch.nn.functional.max_pool1d(
+                scores,
+                kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2,
+                stride=1)
+
+            selected_prefix_indices = scores.topk(
+                self.prompt_budget - self.window_size,
+                dim=-1).indices.sort().values.to(torch.int32)
+        else:
+            selected_prefix_indices = torch.empty(
+                (0, self.num_kv_heads, self.prompt_budget - self.window_size),
+                device=qkv.device,
+                dtype=torch.int32)
 
         # Flatten sparse indices
         sparse_kv_indices = flatten_sparse_indices(
@@ -573,19 +581,6 @@ class RocketTrtllmAttention(TrtllmAttention):
         metadata.num_ctx_tokens
         if metadata.num_generations == 0:
             return None, None
-
-        kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
-            self.layer_idx)
-        kt_states = triton_load_kt_cache(
-            kt_cache_tensor=kt_cache_tensor,
-            block_offsets=metadata.kt_cache_block_offsets[metadata.
-                                                          num_contexts:],
-            cum_kt_lens=metadata.cum_kt_lens_cuda[:metadata.num_generations +
-                                                  1],
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            tokens_per_block=metadata.kt_tokens_per_block,
-        )
 
         q, k, dim_pos = self.preprocess_for_gen(qkv, metadata)
 
@@ -1303,7 +1298,6 @@ class RocketKVCacheManager(KVCacheManager):
                 seq_len = request.get_num_tokens(0)
                 rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
                 self.rewind_kv_cache(request, rewind_len)
-                self.rewind_kt_cache(request, rewind_len)
 
     def rewind_kt_cache(self, request, rewind_len):
         request_id = request.py_request_id
@@ -1347,7 +1341,7 @@ class RocketKVCacheManager(KVCacheManager):
         self.free_blocks.extend(page_list)
 
     def compute_page_count(self, token_count: int, tokens_per_page: int) -> int:
-        return (token_count + tokens_per_page - 1) // tokens_per_page
+        return (token_count + 1 + tokens_per_page - 1) // tokens_per_page
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,

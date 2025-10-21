@@ -732,13 +732,12 @@ def reshape_flatten_to_batched_kernel(
         tl.store(output_ptr + output_indices, values, mask=pos_mask)
 
 
-def reshape_flatten_to_batched(
-    input_tensor: torch.Tensor,
-    context_lens: torch.Tensor,
-    cu_context_lens: torch.Tensor,
-    batch_size: int,
-    padding_size: int,
-    padding_value=float('-inf')) -> torch.Tensor:
+def reshape_flatten_to_batched(input_tensor: torch.Tensor,
+                               context_lens: torch.Tensor,
+                               cu_context_lens: torch.Tensor,
+                               batch_size: int,
+                               padding_size: int,
+                               padding_value=-1e10) -> torch.Tensor:
     """
     Reshape input_tensor from [num_heads, total_tokens] to [batch_size, num_heads, padding_size]
 
