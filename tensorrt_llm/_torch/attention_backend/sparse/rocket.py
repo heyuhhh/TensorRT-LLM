@@ -1287,10 +1287,17 @@ class RocketKVCacheManager(KVCacheManager):
 
     def prepare_resources(self, scheduled_batch):
         super().prepare_resources(scheduled_batch)
-        for req in scheduled_batch.all_requests():
-            request_id = req.py_request_id
-            kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
-            self.add_kt_tokens(request_id, kt_token_num)
+
+        for req in scheduled_batch.context_requests:
+            num_tokens = req.max_beam_num_tokens
+            kt_token_num = math.ceil(num_tokens / self.page_size)
+            self.add_kt_tokens(req.py_request_id, kt_token_num)
+
+        for req in scheduled_batch.generation_requests:
+            # generation request excludes the last token
+            num_tokens = req.max_beam_num_tokens + 1
+            kt_token_num = math.ceil(num_tokens / self.page_size)
+            self.add_kt_tokens(req.py_request_id, kt_token_num)
 
     def update_resources(self, scheduled_batch):
         for request in scheduled_batch.context_requests:
@@ -1341,7 +1348,7 @@ class RocketKVCacheManager(KVCacheManager):
         self.free_blocks.extend(page_list)
 
     def compute_page_count(self, token_count: int, tokens_per_page: int) -> int:
-        return (token_count + 1 + tokens_per_page - 1) // tokens_per_page
+        return (token_count + tokens_per_page - 1) // tokens_per_page
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
