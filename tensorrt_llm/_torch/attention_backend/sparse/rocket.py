@@ -27,7 +27,8 @@ from .kernel import (bmm, flatten_sparse_indices, fused_qk_split,
                      triton_index_gather, triton_load_kt_cache,
                      triton_reduce_scores_context,
                      triton_reduce_scores_generation, triton_softmax,
-                     triton_topk, triton_update_kt_cache)
+                     triton_topk, triton_update_kt_cache,
+                     triton_update_kt_cache_ctx)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -517,17 +518,20 @@ class RocketTrtllmAttention(TrtllmAttention):
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
 
-        triton_update_kt_cache(
+        triton_update_kt_cache_ctx(
             qkv_input.contiguous(),
             kt_cache_tensor,
-            metadata.kt_cache_block_offsets,
-            metadata.kv_lens_cuda_runtime[0:metadata.num_contexts],
+            metadata.kt_cache_block_offsets[:metadata.num_contexts],
+            metadata.context_cumsum_cuda[:metadata.num_contexts + 1],
+            sparse_kv_indices,
+            metadata.sparse_offsets_cuda[:metadata.num_contexts + 1],
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
             self.page_size,
             metadata.kt_tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
-            sparse_kv_indices,
-            metadata.sparse_offsets_cuda[0:metadata.num_contexts + 1],
-            update=False)
+        )
 
         return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
                                                                num_contexts + 1]
