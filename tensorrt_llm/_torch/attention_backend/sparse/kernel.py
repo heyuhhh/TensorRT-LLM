@@ -2197,10 +2197,13 @@ def triton_topk(
         kv_lens: torch.Tensor,
         kt_lens: torch.Tensor,
         kv_cu_lens: torch.Tensor,
+        sparse_offsets: torch.Tensor,
+        total_sparse_attn_indices: int,
         total_kv_tokens: int,
+        max_attn_seq_len: int,
         topk: int,
         kt_page_size: int,
-        use_interleave: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        use_interleave: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform topk operation with optional interleaving.
 
@@ -2209,7 +2212,12 @@ def triton_topk(
         kt_offsets: KT offsets [batch_size + 1]
         kv_lens: KV lengths [batch_size]
         kt_lens: KT lengths [batch_size]
-        topk: TopK parameter
+        kv_cu_lens: KV cumulative lengths [batch_size + 1]
+        sparse_offsets: Sparse offsets [batch_size + 1]
+        total_sparse_attn_indices: Total number of sparse attention indices
+        total_kv_tokens: Total number of KV tokens
+        max_attn_seq_len: Maximum sequence length
+        topk: scalar of TopK parameter
         kt_page_size: Page size for interleaving
         use_interleave: Whether to perform interleaving
 
@@ -2247,35 +2255,23 @@ def triton_topk(
         # Use interleaved tensor and kv_cu_lens for topk
         working_tensor = interleaved_tensor
         working_offsets = kv_cu_lens
-        working_lens = kv_lens
     else:
         # Use original tensor and kt_offsets for topk
         working_tensor = input_tensor
         working_offsets = kt_offsets
-        working_lens = kt_lens
-        topk = (topk + kt_page_size - 1) // kt_page_size
 
-    # Calculate sparse counts and offsets
-    sparse_counts = torch.minimum(torch.tensor(topk, device=device),
-                                  working_lens)
-    sparse_offsets = torch.cumsum(torch.cat(
-        [torch.zeros(1, device=device), sparse_counts]),
-                                  dim=0).to(torch.int32)
-
-    total_sparse_indices = sparse_offsets[-1].item()
     total_working_tokens = working_tensor.shape[1]
-    max_seq_len = working_lens.max().item()
 
     # Create output tensor
-    output_indices = torch.empty((num_kv_heads, total_sparse_indices),
+    output_indices = torch.empty((num_kv_heads, total_sparse_attn_indices),
                                  dtype=torch.int32,
                                  device=device)
 
     # Create temporary storage for topk algorithm (double size for dual-buffer design)
-    temp_values = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
+    temp_values = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
                               dtype=working_tensor.dtype,
                               device=device)
-    temp_indices = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
+    temp_indices = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
                                dtype=torch.int32,
                                device=device)
 
@@ -2292,8 +2288,8 @@ def triton_topk(
         num_kv_heads,
         topk,
         total_working_tokens,
-        total_sparse_indices,
-        max_seq_len,
+        total_sparse_attn_indices,
+        max_attn_seq_len,
         BLOCK_SIZE=512,
         num_warps=16,
         num_stages=3,

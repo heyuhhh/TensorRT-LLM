@@ -23,7 +23,8 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
 LONGBENCH_DATASETS = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
@@ -295,6 +296,10 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             enable_block_reuse=False,  # RocketKV doesn't support KV cache reuse
         )
 
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=args.max_batch_size
+        ) if args.attention_backend == "TRTLLM" else None
+
         if args.rocket_sparse:
             # Configure RocketKV sparse attention
             sparse_attention_config = RocketSparseAttentionConfig(
@@ -319,8 +324,7 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             tensor_parallel_size=args.tensor_parallel_size,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
-            cuda_graph_config=None,
-            torch_compile_config=None,
+            cuda_graph_config=cuda_graph_config,
         )
 
         # Initialize tokenizer

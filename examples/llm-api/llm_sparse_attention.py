@@ -16,7 +16,8 @@ import argparse
 import json
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketSparseAttentionConfig)
 
 
 def read_input(input_file):
@@ -109,6 +110,9 @@ def run_RocketKV(args):
         kernel_size=args.kernel_size,
         prompt_budget=args.prompt_budget,
     )
+    cuda_graph_config = CudaGraphConfig(
+        max_batch_size=args.max_batch_size
+    ) if args.attention_backend == "TRTLLM" else None
 
     llm = LLM(
         model=args.model_path,
@@ -120,8 +124,7 @@ def run_RocketKV(args):
         max_seq_len=args.max_seq_len,
         max_num_tokens=args.max_num_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
-        cuda_graph_config=
-        None,  # sparse attention does not support cuda graph now
+        cuda_graph_config=cuda_graph_config,
     )
 
     prompts = []

@@ -41,6 +41,11 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prompt_budget = self.sparse_attention_config.prompt_budget
         self.window_size = self.sparse_attention_config.window_size
         self.page_size = self.sparse_attention_config.page_size
+        self.topk = self.sparse_attention_config.topk
+        self.use_interleave = self.sparse_attention_config.use_interleave
+
+        if not self.use_interleave:
+            self.topk = (self.topk + self.page_size - 1) // self.page_size
 
         self.context_lens_cuda = torch.empty(
             self.max_num_sequences,
@@ -185,6 +190,20 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                      device='cuda',
                                                      dtype=torch.int32)
 
+        self.sparse_attn_counts = torch.empty(
+            self.max_num_sequences,
+            device='cpu',
+            dtype=torch.int32,
+        )
+
+        self.sparse_attn_offsets = torch.zeros(
+            self.max_num_sequences + 1,
+            device='cpu',
+            dtype=torch.int32,
+        )
+        self.sparse_attn_offsets_cuda = torch.empty_like(
+            self.sparse_attn_offsets, device='cuda', dtype=torch.int32)
+
     @property
     def kt_tokens_per_block(self) -> Optional[int]:
         """
@@ -293,6 +312,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.k_extract_lengths[:
                                valid_batch_size] = self.k_context_lens[:
                                                                        valid_batch_size]
+        self.k_extract_start_offsets[:valid_batch_size] = torch.zeros(
+            valid_batch_size, device='cpu', dtype=torch.int32)
         self.k_output_offsets[:
                               valid_batch_size] = self.k_cu_seqlens[:
                                                                     valid_batch_size]
@@ -301,6 +322,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.k_cu_seqlens[:valid_batch_size + 1], non_blocking=True)
         self.k_extract_lengths_cuda[:valid_batch_size].copy_(
             self.k_extract_lengths[:valid_batch_size], non_blocking=True)
+        self.k_extract_start_offsets_cuda[:valid_batch_size].copy_(
+            self.k_extract_start_offsets[:valid_batch_size], non_blocking=True)
         self.k_output_offsets_cuda[:valid_batch_size].copy_(
             self.k_output_offsets[:valid_batch_size], non_blocking=True)
 
@@ -318,19 +341,33 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.cum_kt_lens_cuda[:self.num_generations + 1].copy_(
             self.cum_kt_lens[:self.num_generations + 1], non_blocking=True)
 
-        if self.num_generations > 0:
-            self.max_kt_tokens = self.num_kt_tokens[:self.num_generations].max(
-            ).item()
-
-        self.total_kt_tokens = self.cum_kt_lens[self.num_generations].item()
+        self.max_kt_tokens = (self.max_seq_len + self.page_size -
+                              1) // self.page_size
+        self.total_kt_tokens = self.num_generations * self.max_kt_tokens
+        self.total_kv_tokens = self.num_generations * self.max_seq_len
 
         self.cum_kv_gen_lens[1:self.num_generations + 1] = torch.cumsum(
             self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs], dim=0)
         self.cum_kv_gen_lens_cuda[:self.num_generations + 1].copy_(
             self.cum_kv_gen_lens[:self.num_generations + 1], non_blocking=True)
 
-        self.total_kv_gen_tokens = self.cum_kv_gen_lens[
-            self.num_generations].item()
+        topk_tensor = torch.tensor(self.topk, device='cuda', dtype=torch.int32)
+
+        if self.use_interleave:
+            self.sparse_attn_counts[:self.num_generations] = torch.minimum(
+                topk_tensor,
+                self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs])
+        else:
+            self.sparse_attn_counts[:self.num_generations] = torch.minimum(
+                topk_tensor, self.num_kt_tokens[:self.num_generations])
+
+        self.sparse_attn_offsets[1:self.num_generations + 1] = torch.cumsum(
+            self.sparse_attn_counts[:self.num_generations], dim=0)
+        self.sparse_attn_offsets_cuda[:self.num_generations + 1].copy_(
+            self.sparse_attn_offsets[:self.num_generations + 1],
+            non_blocking=True)
+
+        self.total_sparse_attn_indices = self.topk * self.num_generations
 
 
 class RocketTrtllmAttention(TrtllmAttention):
@@ -541,6 +578,10 @@ class RocketTrtllmAttention(TrtllmAttention):
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
         )
 
+        # Reduce overhead of post processing
+        if metadata.valid_batch_size == 0:
+            return None, None
+
         return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
                                                                num_contexts + 1]
 
@@ -612,10 +653,13 @@ class RocketTrtllmAttention(TrtllmAttention):
                                           num_seqs],
             metadata.num_kt_tokens_cuda[:metadata.num_generations],
             metadata.cum_kv_gen_lens_cuda[:metadata.num_generations + 1],
-            metadata.total_kv_gen_tokens,
+            metadata.sparse_attn_offsets_cuda[:metadata.num_generations + 1],
+            metadata.total_sparse_attn_indices,
+            metadata.total_kv_tokens,
+            metadata.max_seq_len,
             self.topk,
             self.page_size,
-            use_interleave=True)
+            use_interleave=metadata.use_interleave)
 
         return selected_indices, sparse_attn_offsets
 
@@ -1250,6 +1294,7 @@ class RocketKVCacheManager(KVCacheManager):
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        num_extra_decoding_steps: int = 0,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -1259,6 +1304,7 @@ class RocketKVCacheManager(KVCacheManager):
             max_num_draft_tokens=max_num_draft_tokens,
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
         )
         if prepare_resource:
             for req in requests:

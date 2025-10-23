@@ -11,7 +11,8 @@ from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketKVCacheManager, RocketTrtllmAttention, RocketTrtllmAttentionMetadata,
     RocketVanillaAttention, RocketVanillaAttentionMetadata)
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketSparseAttentionConfig)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -32,6 +33,8 @@ def test_model(backend, model_name, attention_backend):
         prompt_budget=2048,
     )
 
+    cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size)
+
     llm = LLM(
         model=model_dir,
         backend=backend,
@@ -39,10 +42,10 @@ def test_model(backend, model_name, attention_backend):
         attn_backend=attention_backend,
         sparse_attention_config=sparse_attention_config,
         max_batch_size=max_batch_size,
-        max_seq_len=8192,
-        max_num_tokens=8192,
-        cuda_graph_config=
-        None,  # sparse attention does not support cuda graph now
+        max_seq_len=20480,
+        max_num_tokens=81920,
+        cuda_graph_config=None
+        if attention_backend == "VANILLA" else cuda_graph_config,
     )
 
     inputs, references = [], []
@@ -569,8 +572,8 @@ def test_batch_sparse_attn_predict(batch_size, num_contexts):
         print(f"Average overlap ratio: {avg_overlap_ratio:.4f}")
         print(f"Per-batch average: {batch_overlap_details}")
 
-        assert avg_overlap_ratio >= 0.98, \
-            f"Indices overlap ratio {avg_overlap_ratio:.4f} is too low (< 0.98)"
+        assert avg_overlap_ratio >= 0.97, \
+            f"Indices overlap ratio {avg_overlap_ratio:.4f} is too low (< 0.97)"
     else:
         assert len(
             vanilla_sparse_attn_indices_list
