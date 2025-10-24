@@ -22,11 +22,10 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import (bmm, flatten_sparse_indices, fused_qk_split,
-                     kt_cache_update_and_bmm, reshape_flatten_to_batched,
-                     triton_index_gather, triton_reduce_scores_context,
-                     triton_reduce_scores_generation, triton_softmax,
-                     triton_topk, triton_update_kt_cache,
+from .kernel import (triton_bmm, triton_flatten_sparse_indices,
+                     triton_flatten_to_batched, triton_index_gather,
+                     triton_kt_cache_update_and_bmm, triton_reduce_scores,
+                     triton_rocket_qk_split, triton_softmax, triton_topk,
                      triton_update_kt_cache_ctx)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -343,6 +342,16 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.max_kt_tokens = (self.max_seq_len + self.page_size -
                               1) // self.page_size
+        if self.num_generations > 0:
+            self.max_real_kt_tokens = self.num_kt_tokens[:self.
+                                                         num_generations].max(
+                                                         ).item()
+            self.max_real_kv_tokens = self.kv_lens_cuda_runtime[
+                self.num_contexts:self.num_seqs].max().item()
+        else:
+            self.max_real_kt_tokens = 0
+            self.max_real_kv_tokens = 0
+
         self.total_kt_tokens = self.num_generations * self.max_kt_tokens
         self.total_kv_tokens = self.num_generations * self.max_seq_len
 
@@ -406,82 +415,6 @@ class RocketTrtllmAttention(TrtllmAttention):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def sparse_attn_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Predict sparse attention indices.
-        For RocketKV:
-        - Generation phase: predict RocketKV sparse attention indices
-
-        Returns:
-            - sparse_attn_indices: [total_selected_indices, num_kv_heads]
-            - sparse_attn_offsets: [batch_size + 1] with cumulative indices count
-        """
-        if k is None:
-            q, k, _ = q.split([
-                self.num_heads * self.head_dim, self.num_kv_heads *
-                self.head_dim, self.num_kv_heads * self.head_dim
-            ],
-                              dim=-1)
-
-        num_contexts = metadata.num_contexts
-        num_generations = metadata.num_generations
-        seq_lens = metadata.seq_lens
-        seq_lens_kv = metadata.seq_lens_kv if metadata.seq_lens_kv is not None else seq_lens
-        past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-
-        sparse_attn_indices = []
-        sparse_attn_offsets = [0]
-
-        q_offset = 0
-        k_offset = 0
-
-        for i in range(num_contexts + num_generations):
-            seq_len = seq_lens[i].item()
-            seq_len_kv = seq_lens_kv[i].item()
-
-            if seq_len <= 0 or seq_len_kv <= 0:
-                assert False, "Invalid sequence length"
-
-            single_q = q[q_offset:q_offset + seq_len]
-            single_k = k[k_offset:k_offset + seq_len_kv]
-
-            single_q = single_q.view(1, seq_len, self.num_heads,
-                                     self.head_dim).transpose(1, 2)
-            single_k = single_k.view(1, seq_len_kv, self.num_kv_heads,
-                                     self.head_dim)
-
-            past_seen_token = past_seen_tokens[i]
-            # Generation phase: RocketKV sparse attention indices
-            if i >= num_contexts:
-                _sparse_attn_indices = self._rocketkv_selection(
-                    single_q, single_k, past_seen_token, metadata, i)
-                if _sparse_attn_indices is not None:
-                    sparse_attn_indices.append(
-                        _sparse_attn_indices.squeeze(0))  # [topk, num_kv_heads]
-                    sparse_attn_offsets.append(sparse_attn_offsets[-1] +
-                                               _sparse_attn_indices.size(1))
-                else:
-                    sparse_attn_offsets.append(sparse_attn_offsets[-1])
-
-            q_offset += seq_len
-            k_offset += seq_len_kv
-
-        if len(sparse_attn_indices) == 0:
-            sparse_attn_indices, sparse_attn_offsets = None, None
-        else:
-            sparse_attn_indices = torch.cat(sparse_attn_indices,
-                                            dim=0).to(torch.int32).transpose(
-                                                0, 1).contiguous()
-            sparse_attn_offsets = torch.tensor(sparse_attn_offsets,
-                                               dtype=torch.int32).to(q.device)
-        return sparse_attn_indices, sparse_attn_offsets
-
     def batch_sparse_kv_predict(
         self,
         qkv: torch.Tensor,
@@ -502,40 +435,46 @@ class RocketTrtllmAttention(TrtllmAttention):
         qkv_input = qkv[:num_ctx_tokens]
 
         if metadata.valid_batch_size > 0:
-            q_window, k_context = fused_qk_split(qkv_input, self.num_heads,
-                                                 self.num_kv_heads,
-                                                 self.head_dim,
-                                                 self.window_size,
-                                                 self.prompt_budget, metadata)
+            q_window, k_context = triton_rocket_qk_split(
+                qkv_input,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.window_size,
+                self.prompt_budget,
+                metadata.context_cumsum_cuda,
+                metadata.valid_batch_size,
+                metadata.valid_seq_indices_cuda,
+                metadata.q_extract_start_offsets_cuda,
+                metadata.q_extract_lengths_cuda,
+                metadata.q_output_offsets_cuda,
+                metadata.k_extract_start_offsets_cuda,
+                metadata.k_extract_lengths_cuda,
+                metadata.k_output_offsets_cuda,
+            )
 
-            scores = bmm(q_window,
-                         k_context,
-                         metadata.q_cu_seqlens_cuda,
-                         metadata.k_cu_seqlens_cuda,
-                         metadata.valid_batch_size,
-                         causal=False)
+            scores = triton_bmm(q_window,
+                                k_context,
+                                metadata.q_cu_seqlens_cuda,
+                                metadata.k_cu_seqlens_cuda,
+                                metadata.valid_batch_size,
+                                causal=False)
 
             scores = triton_softmax(scores, metadata.k_cu_seqlens_cuda,
                                     metadata.valid_batch_size)
 
-            # Sum over q_len_per_seq (window_size) and num_heads_per_kv for each batch separately
-            scores = triton_reduce_scores_context(
-                scores,
-                metadata.q_cu_seqlens_cuda,
-                metadata.k_cu_seqlens_cuda,
-                metadata.valid_batch_size,
-                self.num_kv_heads,
-                self.num_heads // self.num_kv_heads,
-                self.window_size,
-            )
+            # scores: [num_heads, window_size, total_k_tokens] -> [num_kv_heads, total_k_tokens]
+            scores = scores.view(self.num_kv_heads,
+                                 self.num_heads // self.num_kv_heads,
+                                 self.window_size, -1).sum(dim=(1, 2))
 
             # Reshape scores to handle variable length sequences with padding using Triton
             # scores: [num_kv_heads, total_k_tokens] -> [valid_batch_size, num_kv_heads, padding_size]
-            scores = reshape_flatten_to_batched(scores,
-                                                metadata.k_context_lens_cuda,
-                                                metadata.k_cu_seqlens_cuda,
-                                                metadata.valid_batch_size,
-                                                metadata.max_k_context_tokens)
+            scores = triton_flatten_to_batched(scores,
+                                               metadata.k_context_lens_cuda,
+                                               metadata.k_cu_seqlens_cuda,
+                                               metadata.valid_batch_size,
+                                               metadata.max_k_context_tokens)
 
             scores = torch.nn.functional.max_pool1d(
                 scores,
@@ -553,7 +492,7 @@ class RocketTrtllmAttention(TrtllmAttention):
                 dtype=torch.int32)
 
         # Flatten sparse indices
-        sparse_kv_indices = flatten_sparse_indices(
+        sparse_kv_indices = triton_flatten_sparse_indices(
             selected_prefix_indices, metadata.context_lens_cuda,
             metadata.valid_seq_indices_cuda, metadata.k_context_lens_cuda,
             metadata.sparse_offsets_cuda, metadata.num_contexts,
@@ -562,6 +501,8 @@ class RocketTrtllmAttention(TrtllmAttention):
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
+        sparse_kv_offsets = metadata.sparse_offsets_cuda[:metadata.
+                                                         num_contexts + 1]
 
         triton_update_kt_cache_ctx(
             qkv_input.contiguous(),
@@ -569,7 +510,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             metadata.kt_cache_block_offsets[:metadata.num_contexts],
             metadata.context_cumsum_cuda[:metadata.num_contexts + 1],
             sparse_kv_indices,
-            metadata.sparse_offsets_cuda[:metadata.num_contexts + 1],
+            sparse_kv_offsets,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -582,8 +523,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         if metadata.valid_batch_size == 0:
             return None, None
 
-        return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
-                                                               num_contexts + 1]
+        return sparse_kv_indices, sparse_kv_offsets
 
     @torch.compile(dynamic=True)
     def preprocess_for_gen(
@@ -619,286 +559,61 @@ class RocketTrtllmAttention(TrtllmAttention):
         metadata: TrtllmAttentionMetadata,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        metadata.num_ctx_tokens
         if metadata.num_generations == 0:
             return None, None
 
         q, k, dim_pos = self.preprocess_for_gen(qkv, metadata)
 
-        scores = kt_cache_update_and_bmm(
+        scores = triton_kt_cache_update_and_bmm(
             q,
             k,
             dim_pos,
-            self.layer_idx,
-            metadata,
+            metadata.kv_lens_cuda_runtime[metadata.num_contexts:],
+            metadata.page_size,
+            metadata.kt_tokens_per_block,
+            metadata.kv_cache_manager.max_kt_blocks_per_seq,
+            metadata.num_kt_tokens_cuda,
+            metadata.total_kt_tokens,
+            metadata.kv_cache_manager.get_kt_buffers(self.layer_idx),
+            metadata.kt_cache_block_offsets[metadata.num_contexts:],
+            metadata.cum_kt_lens_cuda,
+            metadata.max_real_kt_tokens,
         )
 
         scores = triton_softmax(scores, metadata.cum_kt_lens_cuda,
                                 metadata.num_generations)
 
         # Mean over num_heads_per_kv for each batch separately
-        scores = triton_reduce_scores_generation(
+        scores = triton_reduce_scores(
             scores,
-            metadata.cum_kt_lens_cuda[:metadata.num_generations + 1],
+            metadata.cum_kt_lens_cuda,
             metadata.num_generations,
             self.num_kv_heads,
             self.num_heads // self.num_kv_heads,
         )
 
+        sparse_attn_offsets = metadata.sparse_attn_offsets_cuda[:metadata.
+                                                                num_generations +
+                                                                1]
+
         # Use triton_topk to select sparse attention indices
-        selected_indices, sparse_attn_offsets = triton_topk(
+        selected_indices = triton_topk(
             scores,
-            metadata.cum_kt_lens_cuda[:metadata.num_generations + 1],
+            metadata.cum_kt_lens_cuda,
             metadata.kv_lens_cuda_runtime[metadata.num_contexts:metadata.
                                           num_seqs],
-            metadata.num_kt_tokens_cuda[:metadata.num_generations],
-            metadata.cum_kv_gen_lens_cuda[:metadata.num_generations + 1],
-            metadata.sparse_attn_offsets_cuda[:metadata.num_generations + 1],
+            metadata.cum_kv_gen_lens_cuda,
+            sparse_attn_offsets,
             metadata.total_sparse_attn_indices,
             metadata.total_kv_tokens,
             metadata.max_seq_len,
+            metadata.max_real_kt_tokens,
+            metadata.max_real_kv_tokens,
             self.topk,
             self.page_size,
             use_interleave=metadata.use_interleave)
 
         return selected_indices, sparse_attn_offsets
-
-    def sparse_kv_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Predict sparse kv indices.
-
-        For RocketKV:
-        - Context phase: predict RocketKV sparse kv indices
-
-        Returns:
-            - flattened_indices: [total_selected_indices, num_kv_heads]
-            - batch_offsets: [batch_size + 1] with cumulative indices count
-        """
-        if k is None:
-            q, k, _ = q.split([
-                self.num_heads * self.head_dim, self.num_kv_heads *
-                self.head_dim, self.num_kv_heads * self.head_dim
-            ],
-                              dim=-1)
-
-        num_contexts = metadata.num_contexts
-        num_generations = metadata.num_generations
-        seq_lens = metadata.seq_lens
-        seq_lens_kv = metadata.seq_lens_kv if metadata.seq_lens_kv is not None else seq_lens
-        past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-
-        sparse_kv_indices = []
-        sparse_kv_offsets = [0]
-
-        q_offset = 0
-        k_offset = 0
-
-        for i in range(num_contexts + num_generations):
-            seq_len = seq_lens[i].item()
-            seq_len_kv = seq_lens_kv[i].item()
-
-            if seq_len <= 0 or seq_len_kv <= 0:
-                assert False, "Invalid sequence length"
-
-            single_q = q[q_offset:q_offset + seq_len]
-            single_k = k[k_offset:k_offset + seq_len_kv]
-
-            single_q = single_q.view(1, seq_len, self.num_heads,
-                                     self.head_dim).transpose(1, 2)
-            single_k = single_k.view(1, seq_len_kv, self.num_kv_heads,
-                                     self.head_dim)
-
-            past_seen_token = past_seen_tokens[i]
-            if i < num_contexts:
-                # Context phase: SnapKV sparse kv indices
-                _sparse_kv_indices = self._get_snapkv_indices(
-                    single_q, single_k, past_seen_token, metadata, i)
-                if _sparse_kv_indices is not None:
-                    sparse_kv_indices.append(
-                        _sparse_kv_indices.squeeze(0))  # [budget, num_kv_heads]
-                    sparse_kv_offsets.append(sparse_kv_offsets[-1] +
-                                             _sparse_kv_indices.size(1))
-                else:
-                    sparse_kv_offsets.append(sparse_kv_offsets[-1])
-
-            q_offset += seq_len
-            k_offset += seq_len_kv
-
-        if len(sparse_kv_indices) == 0:
-            sparse_kv_indices, sparse_kv_offsets = None, None
-        else:
-            sparse_kv_indices = torch.cat(sparse_kv_indices,
-                                          dim=0).to(torch.int32)
-            sparse_kv_indices = sparse_kv_indices.transpose(0, 1).contiguous()
-            sparse_kv_offsets = torch.tensor(sparse_kv_offsets,
-                                             dtype=torch.int32).to(q.device)
-        return sparse_kv_indices, sparse_kv_offsets
-
-    def _get_snapkv_indices(self, q: Tensor, k: Tensor, past_seen_token: int,
-                            metadata: RocketTrtllmAttentionMetadata,
-                            sample_idx: int) -> Optional[Tensor]:
-        """
-        Get SnapKV sparse kv indices from the input sequence for context phase.
-        The shape of output is (1, prompt_budget, num_kv_heads)
-        """
-        bsz = 1
-        seq_len = k.size(1)  # k shape: (1, seq_len, num_kv_heads, head_dim)
-
-        # If the sequence length is less than the prompt budget, do not enable sparse kv cache
-        if seq_len <= self.prompt_budget:
-            return None
-
-        # Use last window_size tokens as observation
-        # (1, num_heads, window_size, head_dim)
-        q_obs = q[:, :, -self.window_size:]
-        # (1, num_kv_heads, seq_len, head_dim)
-        k_pre = repeat_kv(k.transpose(1, 2),
-                          self.num_heads // self.num_kv_heads)
-        k_pre = k_pre[:, :, :-self.window_size]
-
-        score = torch.matmul(q_obs, k_pre.transpose(-1, -2)) / math.sqrt(
-            self.head_dim)
-
-        score = torch.nn.functional.softmax(score, dim=-1)
-
-        score = score.sum(dim=-2)
-
-        score = score.view(bsz, self.num_kv_heads,
-                           self.num_heads // self.num_kv_heads, -1).sum(dim=2)
-        score = torch.nn.functional.max_pool1d(score,
-                                               kernel_size=self.kernel_size,
-                                               padding=self.kernel_size // 2,
-                                               stride=1)
-
-        # Select top important tokens from prefix
-        prefix_len = seq_len - self.window_size
-        selected_prefix_indices = score.topk(self.prompt_budget -
-                                             self.window_size,
-                                             dim=-1).indices.sort().values
-
-        # Combine selected prefix indices with window indices
-        window_indices = torch.arange(
-            prefix_len, seq_len,
-            device=k.device).unsqueeze(0).unsqueeze(0).expand(
-                bsz, self.num_kv_heads, -1)
-        selected_indices = torch.cat([selected_prefix_indices, window_indices],
-                                     dim=-1).transpose(1, 2)
-
-        k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
-        k_snap = triton_index_gather(k, selected_indices)
-        # Update KT cache
-        kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
-            self.layer_idx)
-        k_snap_len = torch.clamp(
-            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
-            max=self.prompt_budget).int()
-        triton_update_kt_cache(
-            k_snap.squeeze(0).contiguous(),
-            kt_cache_tensor,
-            metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
-            k_snap_len,
-            self.page_size,
-            metadata.kt_tokens_per_block,
-            metadata.kv_cache_manager.max_kt_blocks_per_seq,
-            update=False)
-
-        return selected_indices
-
-    def _rocketkv_selection(self, q: Tensor, k: Tensor, past_seen_token: int,
-                            metadata: RocketTrtllmAttentionMetadata,
-                            sample_idx: int) -> Tensor:
-        """
-        Implement RocketKV's two-stage selection process for generation phase.
-        The shape of output is (1, topk, num_kv_heads)
-        """
-        bsz = 1
-        q_len = q.size(2)
-
-        @torch.compile(disable=not torch.cuda.is_available())
-        def _scaled_softmax(x: Tensor, divscale: Tensor | float,
-                            dim: int) -> Tensor:
-            return torch.softmax(x / divscale, dim=dim)
-
-        # Get KT cache for key-token matching
-        kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
-            self.layer_idx)
-        target_seq_len = past_seen_token + 1  # +1 for current token
-
-        # Update KT cache
-        kt_states = triton_update_kt_cache(
-            k.squeeze(0).contiguous(), kt_cache_tensor,
-            metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
-            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
-            self.page_size, metadata.kt_tokens_per_block,
-            metadata.kv_cache_manager.max_kt_blocks_per_seq)
-
-        kt_states = kt_states.unsqueeze(0).permute(0, 2, 3, 1)
-
-        # Reshape query for multi-head processing
-        qi = q.view(bsz, self.num_kv_heads, self.num_heads // self.num_kv_heads,
-                    q_len, self.head_dim)
-        qi_abs = torch.abs(qi)
-
-        # Top-r selection on query features using mask
-        i1 = torch.topk(qi_abs.mean(dim=2, keepdim=True), self.topr,
-                        dim=-1).indices
-
-        # Create mask for query features (similar to preprocess_for_gen)
-        qi_mask = torch.zeros_like(qi)
-        qi_mask.scatter_(-1, i1.expand_as(qi[..., :self.topr]), 1)
-        qi_hat = qi * qi_mask
-
-        # Split kt_states into min and max parts
-        # kt_states shape: (bsz, num_kv_heads, 2*head_dim, num_kt_tokens)
-        kt_min = kt_states[:, :, :self.
-                           head_dim, :]  # (bsz, num_kv_heads, head_dim, num_kt_tokens)
-        kt_max = kt_states[:, :, self.
-                           head_dim:, :]  # (bsz, num_kv_heads, head_dim, num_kt_tokens)
-
-        # Build kt_selected by selecting min or max for each feature based on qi_hat sign
-        # qi_hat.sum(dim=2): (bsz, num_kv_heads, q_len, head_dim)
-        # For each (kv_head, q_pos, feature_dim), select kt_min or kt_max based on sign
-        use_max = (qi_hat.sum(dim=2)
-                   > 0)  # (bsz, num_kv_heads, q_len, head_dim)
-
-        # kt_selected: select between kt_min and kt_max for each feature
-        # Shape stays (bsz, num_kv_heads, head_dim, num_kt_tokens) per q_position
-        kt_selected = torch.where(
-            use_max[..., None],  # (bsz, num_kv_heads, q_len, head_dim, 1)
-            kt_max[:, :,
-                   None, :, :],  # (bsz, num_kv_heads, 1, head_dim, num_kt_tokens)
-            kt_min[:, :,
-                   None, :, :]  # (bsz, num_kv_heads, 1, head_dim, num_kt_tokens)
-        )
-        # kt_selected: (bsz, num_kv_heads, q_len, head_dim, num_kt_tokens)
-
-        # Matrix multiplication
-        # qi_hat: (bsz, num_kv_heads, num_heads // num_kv_heads, q_len, head_dim)
-        # kt_selected: (bsz, num_kv_heads, q_len, head_dim, num_kt_tokens)
-        # Add num_heads dimension to kt_selected for broadcasting
-        kt_selected = kt_selected[:, :,
-                                  None, :, :, :]  # (bsz, num_kv_heads, 1, q_len, head_dim, num_kt_tokens)
-        qk_hat = torch.matmul(qi_hat.unsqueeze(-2), kt_selected).squeeze(-2)
-        # qk_hat: (bsz, num_kv_heads, num_heads // num_kv_heads, q_len, num_kt_tokens)
-
-        qk_hat = torch.softmax(qk_hat / math.sqrt(self.head_dim), dim=-1)
-        qk_hat = qk_hat.mean(dim=2, keepdim=True)
-
-        qk_hat = qk_hat.repeat_interleave(self.page_size,
-                                          dim=-1)[:, :, :, :, :target_seq_len]
-
-        topk = min(self.topk, target_seq_len)
-        i2 = torch.topk(qk_hat, topk, dim=-1).indices
-
-        iKV = i2[:, :, 0, 0, :].transpose(1, 2)  # (1, topk, num_kv_heads)
-
-        return iKV
 
 
 class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):

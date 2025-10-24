@@ -378,7 +378,8 @@ def test_batch_sparse_attn_predict(batch_size, num_contexts):
         else:
             # Generation phase: single token
             seq_lens.append(1)
-            past_seen_tokens.append(torch.randint(100, 300, (1, )).item())
+            # 128 is the minimum number of tokens for shape alignment
+            past_seen_tokens.append(torch.randint(128, 300, (1, )).item())
 
     request_ids = list(range(batch_size))
 
