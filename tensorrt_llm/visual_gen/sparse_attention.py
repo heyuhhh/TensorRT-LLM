@@ -200,7 +200,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class VideoSparseAttentionConfig(StrictBaseModel):
-    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+    """Video Sparse Attention (VSA) recipe for TRTLLM or CUTEDSL backends.
 
     Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
     and a block-sparse fine stage over the top-K cubes selected per head.

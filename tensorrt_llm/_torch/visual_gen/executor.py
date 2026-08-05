@@ -510,14 +510,11 @@ def run_diffusion_worker(
                 )
 
         # NCCL_NVLS_ENABLE=0 is required to prevent a hang on Blackwell when
-        # VSA (CuTeDSL) + Ulysses is active
+        # VSA + Ulysses is active, independent of the VSA fine-stage backend.
         if torch.cuda.is_available() and visual_gen_args is not None:
             _attn = visual_gen_args.attention_config
             _sa = getattr(_attn, "sparse_attention_config", None)
-            _is_vsa = (
-                getattr(_attn, "backend", "") == "CUTEDSL"
-                and getattr(_sa, "algorithm", "") == "vsa"
-            )
+            _is_vsa = getattr(_sa, "algorithm", "") == "vsa"
             _has_ulysses = getattr(visual_gen_args.parallel_config, "ulysses_size", 1) > 1
             if _is_vsa and _has_ulysses:
                 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")

@@ -135,6 +135,22 @@ class WanPipeline(BasePipeline):
             )
 
         super().__init__(pipeline_config)
+        # CUDA graphs capture the VSA partition/mask tensor addresses. Keep
+        # their shape cache alive across requests so replay never references
+        # metadata owned by a completed forward call.
+        self._vsa_metadata_builder = VSAMetadataBuilder()
+
+    def cleanup(self):
+        """Release CUDA graphs before their VSA plan-owned metadata."""
+
+        super().cleanup()
+        for model_config in self.pipeline_config.model_configs.values():
+            metadata_state = getattr(model_config, "attention_metadata_state", None)
+            if metadata_state is None:
+                continue
+            block_sparse_attention = metadata_state.get("vsa_block_sparse_attention")
+            if block_sparse_attention is not None:
+                block_sparse_attention.clear()
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
@@ -540,15 +556,15 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
-        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        # VSA metadata is cached at pipeline scope and reused across requests.
         _attn_cfg = self.pipeline_config.primary_model_config.attention
         _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
         _vsa_active = (
-            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
             and _sparse_cfg is not None
             and getattr(_sparse_cfg, "algorithm", None) == "vsa"
         )
-        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_builder = self._vsa_metadata_builder if _vsa_active else None
         _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
         _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
 

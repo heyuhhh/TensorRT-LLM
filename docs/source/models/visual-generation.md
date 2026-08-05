@@ -57,7 +57,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
+[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Use the `TRTLLM` PrimTS path or the compatibility `CUTEDSL` path on supported Blackwell GPUs. Ring and Attention2D are not supported (no LSE output); Ulysses and CUDA graphs are supported.
 
 [^3]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
 
@@ -232,13 +232,17 @@ args = VisualGenArgs(
 
 ### Video Sparse Attention (VSA)
 
-VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.
+VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a backend-specific fine branch runs block-sparse attention over only those blocks. The two outputs are blended with learned gates.
+
+When a compatible FlashInfer build is installed, the recommended `TRTLLM` path invokes the TRT-LLM PrimTS kernel through FlashInfer's block-sparse wrapper. It passes an exact packed K/V token-validity mask, so padding inside a 4×4×4 VSA block can be non-contiguous. `CUTEDSL` retains the original CuTe VSA kernel as a compatibility and comparison path.
 
 **Requirements:**
 - VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
-- Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
-- `CUTEDSL` attention backend.
+- Blackwell SM100 or SM103, FP16/BF16, MHA, and head dimension 128 for the `TRTLLM` PrimTS path. The VSA block size is 64 tokens; the generic wrapper accepts block sizes divisible by 64.
+- A FlashInfer build that exports `flashinfer.attention.prims_ts.block_sparse.BlockSparseTSWrapper` with `plan(..., dynamic_metadata=True)` for the `TRTLLM` path. A missing capability or unsupported kernel envelope emits a warning and uses dense SDPA for the fine branch.
+- `TRTLLM` is recommended. `CUTEDSL` selects the original VSA fine kernel.
 - Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
+- CUDA graphs are supported by planning each static tensor geometry during the runner's eager warmup. Capture records route canonicalization, token-mask packing, fixed-address workspace updates, and `run()`; a new geometry encountered inside capture is rejected with a plan-cache-miss error.
 
 **`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
 
@@ -251,7 +255,7 @@ from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionCo
 args = VisualGenArgs(
     model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
     attention_config=AttentionConfig(
-        backend="CUTEDSL",
+        backend="TRTLLM",
         sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
     ),
 )
@@ -261,7 +265,7 @@ YAML (for use with `--visual_gen_args` or `trtllm-serve`):
 
 ```yaml
 attention_config:
-  backend: CUTEDSL
+  backend: TRTLLM
   sparse_attention_config:
     algorithm: vsa
     vsa_sparsity: 0.90

@@ -57,6 +57,7 @@ class Attention(nn.Module):
         module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
+        is_cross_attention: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -99,14 +100,15 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
-        _is_vsa = (
-            base_backend == "CUTEDSL"
-            and _sa_cfg is not None
-            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        _is_vsa = _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        is_cross_attention = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            if is_cross_attention is None
+            else is_cross_attention
         )
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+        # Cross-attention fallback: dense TRTLLM and every VSA backend are self-attn only.
+        if is_cross_attention and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
         else:
             backend_name = base_backend
@@ -597,6 +599,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
@@ -693,6 +696,17 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        for gate_key in ("gate_compress", "gate_fine"):
+            gate = kwargs.get(gate_key)
+            if gate is not None:
+                kwargs[gate_key] = gate.view(B, S, self.local_num_attention_heads, D)
+
+        out_4d = self.attn.forward_async(
+            compute_q,
+            compute_k,
+            compute_v,
+            timestep=timestep,
+            **kwargs,
+        )
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

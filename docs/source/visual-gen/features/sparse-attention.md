@@ -20,7 +20,7 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 | `algorithm` | Config class | Status |
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
-| VSA | TBD | TODO |
+| `vsa` | `VideoSparseAttentionConfig` | Prototype |
 
 ## Skip Softmax Attention
 
@@ -159,4 +159,69 @@ Graphs are captured lazily. The first denoising step seen for a given tensor sha
 
 ## Video Sparse Attention (VSA)
 
-TODO
+VSA uses dense coarse attention over mean-pooled 4×4×4 video-token cubes to
+select the top-K K/V cubes for each query cube. A backend-specific block-sparse
+fine stage then attends to those selected cubes, and learned checkpoint gates
+combine the coarse and fine outputs.
+
+Set `attention_config.backend` to choose the implementation:
+
+| Backend | Fine stage | Notes |
+|---|---|---|
+| `TRTLLM` | TRT-LLM PrimTS through FlashInfer's block-sparse wrapper | Recommended; uses exact K/V token validity and supports plan-once CUDA graph replay. |
+| `CUTEDSL` | Original CuTe DSL VSA kernel | Compatibility/comparison path with legacy per-block padding-count semantics; supports CUDA graph capture after JIT warmup. |
+
+The TRT-LLM path requires a FlashInfer build exporting
+`flashinfer.attention.prims_ts.block_sparse.BlockSparseTSWrapper`, including
+the `plan(..., dynamic_metadata=True)` capability. A missing capability emits
+a warning and falls back to dense SDPA. Its
+current kernel envelope is inference-only compact BSHD MHA with FP16/BF16
+tensors, head dimension 128, block sizes divisible by 64, and SM100 or SM103
+GPUs. Other inputs also fall back to dense SDPA.
+
+The wrapper accepts a boolean `kv_token_mask` at the VisualGen adapter boundary
+and packs it into FlashInfer's LSB-first `kv_valid_bits`. VSA derives this mask
+from the exact cube-major padding map, including non-contiguous valid tokens in
+boundary cubes. The `CUTEDSL` compatibility path receives only each block's
+valid-token count, so use the `TRTLLM` path when exact boundary-token masking is
+required.
+
+```python
+from tensorrt_llm.visual_gen import (
+    AttentionConfig,
+    VideoSparseAttentionConfig,
+    VisualGenArgs,
+)
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="TRTLLM",
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+`vsa_sparsity` is the fraction of K/V cubes skipped by the fine branch. VSA
+requires its fine-tuned checkpoint gates and does not support Ring Attention or
+Attention2D because it does not return per-split LSE. Ulysses is supported.
+
+### CUDA Graphs
+
+TRT-LLM VSA supports CUDA graphs with a plan-once/run-many lifecycle. The two
+eager runner warmups create one FlashInfer plan per static tensor geometry and
+allocate fixed-address route and token-mask workspaces. Capture records route
+canonicalization, token-mask packing, in-place workspace refreshes, and
+`run()`, so replay observes per-forward top-K routes and fine-grained padding
+masks. A plan-cache miss during capture is rejected; run an eager warmup for
+each new geometry first.
+
+The model-scoped workspace is shared across serialized transformer layers to
+plan once and avoid one large route allocation per layer. Consequently, calls
+on the same model instance must remain ordered on one CUDA stream; concurrent
+replays need separate model/adapter instances. Pipeline cleanup resets captured
+graphs before releasing all cached VSA plans.
+
+FlashInfer requires strictly increasing block IDs in each BSR row. The adapter
+therefore canonicalizes VSA's top-K routes on every eager call; CUDA graph
+capture records the same sort so replay continues to consume updated routes.

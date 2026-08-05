@@ -37,7 +37,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_combine_import_error = None
 try:
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
-except (ImportError, OSError) as e:
+except (AttributeError, ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
 
@@ -67,9 +67,9 @@ class UlyssesAttention(AttentionBackend):
 
     Wraps any attention backend with sequence parallelism via all-to-all.
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
-    Fully transparent to backend-specific kwargs: everything in ``**kwargs``
-    is forwarded to the inner backend unchanged (except ``seq_len`` which is
-    overridden with the post-all-to-all value).
+    Backend-specific kwargs are forwarded to the inner backend. Sequence
+    lengths are updated after all-to-all, and VSA gates are redistributed with
+    the same sequence/head mapping as Q before they are forwarded.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -335,6 +335,25 @@ class UlyssesAttention(AttentionBackend):
         self._join_async()
         q_5d, k_5d, v_5d = recv["q"], recv["k"], recv["v"]
 
+        # VSA gates originate in the same local sequence/head layout as Q.
+        # Redistribute them before calling the full-sequence, sharded-head backend.
+        gate_compress = attn_kwargs.pop("gate_compress", None)
+        gate_fine = attn_kwargs.pop("gate_fine", None)
+        if gate_compress is not None:
+            gate_compress = all_to_all_4d(
+                gate_compress,
+                scatter_dim=2,
+                gather_dim=1,
+                process_group=self.process_group,
+            )
+        if gate_fine is not None:
+            gate_fine = all_to_all_4d(
+                gate_fine,
+                scatter_dim=2,
+                gather_dim=1,
+                process_group=self.process_group,
+            )
+
         # Fast path: one fused kernel replaces the eager post-A2A chain
         # (6 ops for HND target: permute+reshape+contig + transpose+contig
         # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
@@ -360,8 +379,18 @@ class UlyssesAttention(AttentionBackend):
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()
 
+        if is_hnd:
+            if gate_compress is not None:
+                gate_compress = gate_compress.transpose(1, 2)
+            if gate_fine is not None:
+                gate_fine = gate_fine.transpose(1, 2)
+
         attn_kwargs["seq_len"] = seq_len_full
         attn_kwargs["seq_len_kv"] = seq_len_kv_full
+        if gate_compress is not None:
+            attn_kwargs["gate_compress"] = gate_compress
+        if gate_fine is not None:
+            attn_kwargs["gate_fine"] = gate_fine
         output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
         return self._output_a2a(output, B, seq_len_full)
 

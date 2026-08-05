@@ -19,6 +19,7 @@ from tensorrt_llm.visual_gen.args import (
     QuantAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 
@@ -161,6 +162,52 @@ class TestAttentionConfigQuantValidation:
                 backend="CUTEDSL",
                 quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", q_block_size=1),
             )
+
+
+class TestAttentionConfigVSAValidation:
+    @pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
+    def test_vsa_accepts_backend_specific_implementations(self, backend):
+        attention = AttentionConfig(
+            backend=backend,
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+        )
+
+        assert attention.backend == backend
+
+    def test_vsa_rejects_quantized_attention(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="int8",
+                    q_block_size=1,
+                    k_block_size=1,
+                    v_block_size=1,
+                ),
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+
+    def test_trtllm_vsa_config_allows_cuda_graph(self):
+        args = VisualGenArgs(
+            attention_config=AttentionConfig(
+                backend="TRTLLM",
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            ),
+            cuda_graph_config=CudaGraphConfig(enable=True),
+        )
+
+        assert args.cuda_graph_config.enable
+
+    def test_cutedsl_vsa_config_allows_cuda_graph(self):
+        args = VisualGenArgs(
+            attention_config=AttentionConfig(
+                backend="CUTEDSL",
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            ),
+            cuda_graph_config=CudaGraphConfig(enable=True),
+        )
+
+        assert args.cuda_graph_config.enable
 
 
 class TestPipelineRegistryUnique:

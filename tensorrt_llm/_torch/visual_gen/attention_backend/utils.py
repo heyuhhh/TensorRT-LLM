@@ -45,31 +45,35 @@ def get_visual_gen_attention_backend(
     Backend Selection Guide:
         - "VANILLA": Full support for cross-attention (different Q/KV seq lengths)
                      Uses torch SDPA backend
-        - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
-                    Better performance but requires fused QKV
+        - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths).
+                    create_attention selects the PrimTS implementation for VSA.
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense FMHA or VSA from
-                      AttentionConfig.sparse_attention_config.
+        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense FMHA or CuTe VSA
+                      from AttentionConfig.sparse_attention_config.
     """
-    # Lazy imports to avoid circular dependency
-    from .cute_dsl import CuTeDSLAttention
-    from .flash_attn4 import FlashAttn4Attention
-    from .trtllm import TrtllmAttention
-    from .vanilla import VanillaAttention
-
     backend_name = backend_name.upper()
 
     if backend_name == "VANILLA":
+        from .vanilla import VanillaAttention
+
         return VanillaAttention
     elif backend_name == "TRTLLM":
+        from .trtllm import TrtllmAttention
+
         return TrtllmAttention
     elif backend_name == "FA4":
+        from .flash_attn4 import FlashAttn4Attention
+
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
+        from .cute_dsl import CuTeDSLAttention
+
         return CuTeDSLAttention
     else:
         # Default to VANILLA for maximum compatibility
+        from .vanilla import VanillaAttention
+
         return VanillaAttention
 
 
@@ -108,13 +112,33 @@ def create_attention(
         attention_config: Optional AttentionConfig used to select the attention algorithm and
             forward its quantization or sparsity configuration.
         attention_metadata_state: Optional model-scoped metadata state from
-            visual-gen config. Required for TRTLLM backend.
+            visual-gen config. Required for every TRTLLM implementation; TRTLLM
+            VSA uses it to share its plan cache across layers.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         AttentionBackend instance
     """
-    attn_cls = get_visual_gen_attention_backend(backend)
+    sparse_attention_config = (
+        attention_config.sparse_attention_config if attention_config is not None else None
+    )
+    is_vsa = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "vsa"
+    )
+
+    # Resolve sparse implementations before importing the dense backend. This
+    # keeps algorithm-specific optional dependencies isolated from one another.
+    if is_vsa and backend.upper() == "CUTEDSL":
+        from .cute_dsl.vsa import VSAAttention
+
+        attn_cls = VSAAttention
+    elif is_vsa and backend.upper() == "TRTLLM":
+        from .trtllm_vsa import TrtllmVSAAttention
+
+        attn_cls = TrtllmVSAAttention
+    else:
+        attn_cls = get_visual_gen_attention_backend(backend)
 
     # Forward the validated quantization recipe to TRTLLM or the dense CuTe DSL FMHA backend.
     if attention_config is not None and attention_config.quant_attention_config is not None:
@@ -126,15 +150,8 @@ def create_attention(
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    if backend.upper() == "CUTEDSL" and attention_config is not None:
-        if (
-            attention_config.sparse_attention_config is not None
-            and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
-        ):
-            from .cute_dsl.vsa import VSAAttention
-
-            attn_cls = VSAAttention
-            kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
+    if is_vsa:
+        kwargs["sparse_attention_config"] = sparse_attention_config
 
     return attn_cls(
         layer_idx=layer_idx,
