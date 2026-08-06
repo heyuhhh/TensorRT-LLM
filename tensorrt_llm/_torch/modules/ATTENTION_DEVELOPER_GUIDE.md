@@ -297,22 +297,17 @@ The main differences across backends:
 
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
-`TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `TritonCustomMaskFmha` provides Triton context attention for custom
-masks, `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
-`FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
-DeepSeek-V4 and DSA,
-`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
-the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
-runtime path. These are not separate attention backends.
+`TrtllmAttention` dispatches attention through an ordered registry of internal
+FMHA libraries. These are not separate attention backends. Check
+`fmha/registry.py` for the current libraries, defaults, and canonical order.
 
-`TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
-use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-triton_custom_mask,-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
-to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
+`TLLM_FMHA_LIBS` controls the ordered selection. PrimTS is opt-in because it may
+add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
+`TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update the
+default membership and follow canonical registry order, while an exact list
+preserves the user-specified order. Each FMHA library exposes `is_available()`
+for module/static environment checks and `is_supported()` for per-forward
+request checks.
 For mixed non-MLA batches, the dispatcher checks each active phase independently
 with `is_supported(..., phase=...)`; a phased library accepts only phases backed
 by its corresponding `run_*()` entry point.
@@ -357,6 +352,12 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
+  vendored PrimTS kernels. Before changing the managed source under
+  `attention_backend/prims_ts`, read the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
+  upstream-worthy changes in FlashInfer and update the vendor lock; keep only
+  TRT-LLM-specific adaptations in the persistent patch.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
