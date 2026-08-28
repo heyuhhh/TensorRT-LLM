@@ -305,9 +305,11 @@ FMHA libraries. These are not separate attention backends. Check
 add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
 `TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update the
 default membership and follow canonical registry order, while an exact list
-preserves the user-specified order. Each FMHA library exposes `is_available()`
-for module/static environment checks and `is_supported()` for per-forward
-request checks.
+preserves the user-specified order. PrimTS follows the Triton custom-mask
+library in canonical order, so every request admitted by its request-level
+support check dispatches to it before the remaining default libraries when
+enabled. Each FMHA library exposes `is_available()` for module/static
+environment checks and `is_supported()` for per-forward request checks.
 For mixed non-MLA batches, the dispatcher checks each active phase independently
 with `is_supported(..., phase=...)`; a phased library accepts only phases backed
 by its corresponding `run_*()` entry point.
