@@ -32,7 +32,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -394,10 +394,8 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
         calls.append((local_layer_idx, role))
         return 23
 
-    kv_cache_manager = SimpleNamespace(
-        impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
-        num_local_layers=4,
-    )
+    kv_cache_manager = object.__new__(KVCacheManagerV2)
+    kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
     assert (
         combined_fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=kv_cache_manager))
