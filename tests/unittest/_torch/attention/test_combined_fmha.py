@@ -372,6 +372,8 @@ def test_flashinfer_context_fallback_scope(
     forward_args = AttentionForwardArgs(
         output=torch.empty_like(q),
         attention_input_type=AttentionInputType.mixed,
+        # Exercise fallback selection with valid Q-only cached-KV input.
+        update_kv_cache=False,
     )
 
     supported, reason = fmha._is_supported_with_reason(
