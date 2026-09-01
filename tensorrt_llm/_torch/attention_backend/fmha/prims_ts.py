@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -197,6 +197,8 @@ class PrimsTSFmha(PhasedFmha):
         phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
         """Return a conservative, side-effect-free whole-request support decision."""
+        if fwd.block_sparse_inputs is not None:
+            return False, "block_sparse_inputs are not supported."
         # PrimTS prepares workspace for every active request phase before
         # dispatch. Accept the phased dispatcher keyword, but do not narrow
         # support until that preparation is phase-aware too.
@@ -573,6 +575,27 @@ class PrimsTSFmha(PhasedFmha):
         page_table.copy_(block_tables[:batch_size, 0, :])
         return self._fixed_indptr_buffer[: batch_size + 1], page_table.reshape(-1)
 
+    def _get_generation_workspace_layout(
+        self,
+        dtype: torch.dtype,
+        num_requests: int,
+        num_tokens: int,
+    ) -> dict[str, int]:
+        """Return the shared TRT-LLM generation preprocessing layout."""
+
+        return thop.get_trtllm_gen_generation_workspace_layout(
+            dtype,
+            num_requests,
+            num_tokens,
+            self.attn.num_heads,
+            self.attn.head_dim,
+            self.attn.rope_dim,
+            self.attn.num_kv_heads,
+            0,
+            False,
+            skip_fmha_workspace=True,
+        )
+
     def _stage_context_metadata(
         self,
         block_tables: torch.Tensor,
@@ -890,17 +913,10 @@ class PrimsTSFmha(PhasedFmha):
                 if input_type == AttentionInputType.generation_only
                 else q.shape[0] - int(metadata.num_ctx_tokens)
             )
-            generation_layout = thop.get_trtllm_gen_generation_workspace_layout(
+            generation_layout = self._get_generation_workspace_layout(
                 q.dtype,
                 int(metadata.num_generations),
                 num_gen_tokens_for_layout,
-                self.attn.num_heads,
-                self.attn.head_dim,
-                self.attn.rope_dim,
-                self.attn.num_kv_heads,
-                0,
-                False,
-                skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(generation_layout["total_size"])
@@ -1006,7 +1022,9 @@ class PrimsTSFmha(PhasedFmha):
         self._update_workspace_allocation(workspace)
 
     @staticmethod
-    def _get_prims_mask_type(forward_args: AttentionForwardArgs) -> str:
+    def _get_prims_mask_type(
+        forward_args: AttentionForwardArgs,
+    ) -> Literal["dense", "causal"]:
         mask_type = AttentionMaskType(forward_args.mask_type)
         return "causal" if mask_type == AttentionMaskType.causal else "dense"
 
@@ -1114,7 +1132,7 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
         kv_page_offset = get_kv_page_offset(
             attn,
-            meta,
+            params.meta,
             params.seq_offset,
             cache=self._kv_page_offset_cache,
         )
@@ -1206,11 +1224,8 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("PrimTS decode workspace was not prepared.")
 
         attn = params.attn
-        meta = params.meta
         fwd = params.fwd
-        rope_params = attn.rope_params
         batch_size = params.batch_size
-        attention_chunk_size = attn.attention_chunk_size or 0
         (
             q_processed,
             kv_pool,
@@ -1224,52 +1239,7 @@ class PrimsTSFmha(PhasedFmha):
             _max_kv_len,
             window_left,
             is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
-            params.qkv_input,
-            params.workspace,
-            params.sequence_lengths,
-            params.spec_decoding_generation_lengths,
-            params.spec_decoding_position_offsets,
-            meta.kv_cache_block_offsets,
-            meta.host_kv_cache_pool_pointers,
-            meta.host_kv_cache_pool_mapping,
-            fwd.kv_scale_orig_quant,
-            fwd.kv_scale_quant_orig,
-            fwd.out_scale,
-            attn.rotary_inv_freq,
-            attn.rotary_cos_sin,
-            fwd.mrope_position_deltas,
-            attn.local_layer_idx,
-            params.seq_offset,
-            attn.num_heads,
-            attn.num_kv_heads,
-            attn.head_dim,
-            params.tokens_per_block,
-            attn.quant_mode,
-            params.max_attention_window_size,
-            params.cyclic_attention_window_size,
-            params.num_tokens,
-            batch_size,
-            params.input_seq_length,
-            params.max_past_kv_length,
-            rope_params.dim,
-            rope_params.theta,
-            int(rope_params.scale_type),
-            rope_params.scale,
-            rope_params.max_positions,
-            attn.position_embedding_type,
-            self._get_bmm1_scale(attn),
-            1.0,
-            False,
-            attn.predicted_tokens_per_seq,
-            attention_chunk_size,
-            self._multi_processor_count,
-            params.total_num_blocks,
-            params.kv_factor,
-            True,
-            False,
-            skip_fmha_workspace=True,
-        )
+        ) = self._run_generation_preprocess(params)
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS generation preprocessing returned an FMHA workspace.")
         if is_multi_token_gen:
@@ -1279,7 +1249,7 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("TRT-LLM preprocessing did not return PrimTS KV metadata.")
         kv_page_offset = get_kv_page_offset(
             attn,
-            meta,
+            params.meta,
             params.seq_offset,
             cache=self._kv_page_offset_cache,
         )
@@ -1333,6 +1303,63 @@ class PrimsTSFmha(PhasedFmha):
             bmm1_scale=self._get_bmm1_scale(attn),
             bmm2_scale=1.0,
             out=output,
+        )
+
+    def _run_generation_preprocess(self, params: FmhaParams) -> tuple[Any, ...]:
+        """Run the shared TRT-LLM generation QKV and cache preprocessing."""
+
+        if self._multi_processor_count is None:
+            raise RuntimeError("PrimTS generation workspace was not prepared.")
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        rope_params = attn.rope_params
+        attention_chunk_size = attn.attention_chunk_size or 0
+        return thop.trtllm_gen_generation_preprocess(
+            params.qkv_input,
+            params.workspace,
+            params.sequence_lengths,
+            params.spec_decoding_generation_lengths,
+            params.spec_decoding_position_offsets,
+            meta.kv_cache_block_offsets,
+            meta.host_kv_cache_pool_pointers,
+            meta.host_kv_cache_pool_mapping,
+            fwd.kv_scale_orig_quant,
+            fwd.kv_scale_quant_orig,
+            fwd.out_scale,
+            attn.rotary_inv_freq,
+            attn.rotary_cos_sin,
+            fwd.mrope_position_deltas,
+            attn.local_layer_idx,
+            params.seq_offset,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            params.tokens_per_block,
+            attn.quant_mode,
+            params.max_attention_window_size,
+            params.cyclic_attention_window_size,
+            params.num_tokens,
+            params.batch_size,
+            params.input_seq_length,
+            params.max_past_kv_length,
+            rope_params.dim,
+            rope_params.theta,
+            int(rope_params.scale_type),
+            rope_params.scale,
+            rope_params.max_positions,
+            attn.position_embedding_type,
+            self._get_bmm1_scale(attn),
+            1.0,
+            False,
+            attn.predicted_tokens_per_seq,
+            attention_chunk_size,
+            self._multi_processor_count,
+            params.total_num_blocks,
+            params.kv_factor,
+            True,
+            False,
+            skip_fmha_workspace=True,
         )
 
     def _get_decode_workspace(

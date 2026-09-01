@@ -188,6 +188,14 @@ same user-facing config.
 Sparse registrations are defined in `attention_backend/sparse/registry.py`. Check
 that file for the current supported combinations, as they may change over time.
 
+Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
+Algorithms lower their live routing state to an algorithm-neutral
+`BlockSparseForwardInputs`: block geometry plus either canonical BSR routes or
+an exact packed bitmask. Optional K/V summaries enable proxy routes, and
+optional token-validity bits mask ragged KV tails. Plans contain only static
+format, proxy, geometry, and capacity choices; every run receives the live
+routes, summaries, and validity bits.
+
 ### 2.3 Backend contract
 
 All backends implement the `AttentionBackend` interface.
@@ -301,13 +309,20 @@ The main differences across backends:
 FMHA libraries. These are not separate attention backends. Check
 `fmha/registry.py` for the current libraries, defaults, and canonical order.
 
-`TLLM_FMHA_LIBS` controls the ordered selection. PrimTS is opt-in because it may
-add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
-`TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update the
+`TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
+it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
+defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. The generic
+block-sparse PrimTS library remains enabled by default because a dense fallback
+cannot preserve its routing semantics. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks.
+`AttentionForwardArgs.block_sparse_inputs` is exclusive: the block-sparse
+implementation validates and consumes it, while every other library rejects it
+in `is_supported()`. This preserves normal ordered dispatch without allowing an
+unsupported request to fall through to a dense implementation that ignores its
+routes.
 For mixed non-MLA batches, the dispatcher checks each active phase independently
 with `is_supported(..., phase=...)`; a phased library accepts only phases backed
 by its corresponding `run_*()` entry point.
@@ -352,6 +367,12 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
+  vendored PrimTS contiguous and paged wrappers. Contiguous attention supports
+  BSR and exact-bitmask formats, with optional proxy summaries; paged generation
+  currently supports exact BSR routes. Each FMHA instance directly owns and
+  caches its planned wrappers, while live routes, page tables, and KV lengths
+  remain per-run arguments.
 - `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
   vendored PrimTS kernels. Before changing the managed source under
   `attention_backend/prims_ts`, read the
