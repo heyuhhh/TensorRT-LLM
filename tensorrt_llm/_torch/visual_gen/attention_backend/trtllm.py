@@ -19,7 +19,10 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Generic, Optional, TypeVar, Union
+from typing import Mapping as MappingType
 
 import torch
 
@@ -27,11 +30,51 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
-from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+from ...attention_backend.block_sparse import BlockSparseForwardInputs
+from ...attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionRuntimeFeatures,
+    PredefinedAttentionMask,
+)
+from ...attention_backend.sparse.params import SparseParams
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
+class SparseForwardInputs:
+    """Per-call inputs predicted for the normal TRTLLM attention path.
+
+    The envelope is structurally immutable. Tensor payloads remain live objects
+    so CUDA Graph-compatible predictors can publish values into stable buffers.
+    """
+
+    q: torch.Tensor = field(repr=False)
+    k: Optional[torch.Tensor] = field(repr=False)
+    v: Optional[torch.Tensor] = field(repr=False)
+    batch_size: int
+    seq_len: int
+    seq_len_kv: int
+    attention_mask: PredefinedAttentionMask
+    block_sparse_inputs: Optional[BlockSparseForwardInputs] = field(
+        default=None,
+        repr=False,
+    )
+    forward_kwargs: MappingType[str, object] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "forward_kwargs",
+            MappingProxyType(dict(self.forward_kwargs)),
+        )
+
+
+SparseInputsT = TypeVar("SparseInputsT", bound=SparseForwardInputs)
 
 
 class TrtllmAttentionMetadata:
@@ -176,7 +219,7 @@ class TrtllmAttentionMetadata:
         return self._metadata
 
 
-class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
+class TrtllmAttention(BaseTrtllmAttention, AttentionBackend, Generic[SparseInputsT]):
     """
     TRTLLM Attention wrapper for diffusion models.
 
@@ -185,7 +228,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
+    - Separate-QKV forwarding for generic block-sparse attention
     """
+
+    _enable_sparse_workflow = False
 
     def __init__(
         self,
@@ -199,7 +245,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_seq_len: int = 4096,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
-        sparse_params: Optional[SkipSoftmaxParams] = None,
+        sparse_params: Optional[SparseParams] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -245,7 +291,40 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         qkv = torch.cat([q, k, v], dim=-1)
         return qkv
 
-    def forward(
+    def _should_use_sparse_workflow(self, forward_kwargs: dict[str, object]) -> bool:
+        """Return whether this call should predict sparse forward inputs."""
+
+        return self._enable_sparse_workflow
+
+    def sparse_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        seq_len: int,
+        seq_len_kv: int,
+        attention_mask: PredefinedAttentionMask,
+        forward_kwargs: MappingType[str, object],
+    ) -> SparseInputsT:
+        """Produce block-sparse inputs and the tensors used by normal forward."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement sparse_predict when its "
+            "sparse workflow is enabled."
+        )
+
+    def sparse_post_process(
+        self,
+        output: torch.Tensor,
+        sparse_inputs: SparseInputsT,
+    ) -> torch.Tensor:
+        """Finalize algorithm-specific output after normal TRTLLM forward."""
+
+        return output
+
+    def _forward_impl(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -254,37 +333,33 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
+        block_sparse_inputs: Optional[BlockSparseForwardInputs] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass with automatic metadata handling.
+        """Execute TRTLLM attention with automatic metadata handling."""
 
-        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
-
-        For diffusion models, expects:
-        - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
-            - does not support SageAttention
-        - OR separate Q, K, V which:
-            - for regular TRTLLM attention, will be fused internally
-            - for SageAttention, will be used directly
-
-        Args:
-            q: Query tensor [B, S, H, D] or fused QKV [B, S, H_qkv, D]
-            k: Key tensor [B, S_kv, H_kv, D] or None if fused
-            v: Value tensor [B, S_kv, H_kv, D] or None if fused
-            batch_size: Batch size
-            seq_len: Sequence length for Q
-            attention_mask: Attention mask type
-            seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
-
-        Returns:
-            Output tensor [B, S, H*D]
-        """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
 
-        if self.quant_attention_config is not None:
+        if block_sparse_inputs is not None:
+            if self.quant_attention_config is not None:
+                raise ValueError(
+                    "Generic block-sparse attention does not support quant_attention_config."
+                )
+            if k is None or v is None:
+                raise ValueError("Generic block-sparse attention requires separate Q/K/V tensors.")
+            output = super().forward(
+                q=q.reshape(batch_size * seq_len, -1).contiguous(),
+                k=k.reshape(batch_size * kv_seq_len, -1).contiguous(),
+                v=v.reshape(batch_size * kv_seq_len, -1).contiguous(),
+                metadata=prepared_metadata,
+                forward_args=AttentionForwardArgs(
+                    attention_mask=attention_mask,
+                    block_sparse_inputs=block_sparse_inputs,
+                ),
+            )
+        elif self.quant_attention_config is not None:
             assert k is not None and v is not None, (
                 "SageAttention requires separate Q, K, V tensors"
             )
@@ -319,6 +394,91 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             )
         output = output.view(batch_size, seq_len, -1)
         return output
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        seq_len_kv: Optional[int] = None,
+        block_sparse_inputs: Optional[BlockSparseForwardInputs] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass with automatic metadata handling.
+
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
+        For diffusion models, expects:
+        - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
+            - does not support SageAttention
+        - OR separate Q, K, V which:
+            - for regular TRTLLM attention, will be fused internally
+            - for SageAttention, will be used directly
+
+        Args:
+            q: Query tensor [B, S, H, D] or fused QKV [B, S, H_qkv, D]
+            k: Key tensor [B, S_kv, H_kv, D] or None if fused
+            v: Value tensor [B, S_kv, H_kv, D] or None if fused
+            batch_size: Batch size
+            seq_len: Sequence length for Q
+            attention_mask: Attention mask type
+            seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
+
+        Returns:
+            Output tensor [B, S, H*D]
+        """
+        if block_sparse_inputs is not None and self._enable_sparse_workflow:
+            raise ValueError(
+                "block_sparse_inputs must be produced by sparse_predict "
+                "for lifecycle-enabled attention backends."
+            )
+
+        use_sparse_workflow = self._should_use_sparse_workflow(kwargs)
+        if block_sparse_inputs is not None and use_sparse_workflow:
+            raise ValueError(
+                "block_sparse_inputs must be produced by sparse_predict "
+                "for lifecycle-enabled attention backends."
+            )
+
+        if not use_sparse_workflow:
+            return self._forward_impl(
+                q,
+                k,
+                v,
+                batch_size,
+                seq_len,
+                attention_mask=attention_mask,
+                seq_len_kv=seq_len_kv,
+                block_sparse_inputs=block_sparse_inputs,
+                **kwargs,
+            )
+
+        sparse_inputs = self.sparse_predict(
+            q,
+            k,
+            v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            seq_len_kv=seq_len if seq_len_kv is None else seq_len_kv,
+            attention_mask=attention_mask,
+            forward_kwargs=kwargs,
+        )
+        output = self._forward_impl(
+            sparse_inputs.q,
+            sparse_inputs.k,
+            sparse_inputs.v,
+            sparse_inputs.batch_size,
+            sparse_inputs.seq_len,
+            attention_mask=sparse_inputs.attention_mask,
+            seq_len_kv=sparse_inputs.seq_len_kv,
+            block_sparse_inputs=sparse_inputs.block_sparse_inputs,
+            **sparse_inputs.forward_kwargs,
+        )
+        return self.sparse_post_process(output, sparse_inputs)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
