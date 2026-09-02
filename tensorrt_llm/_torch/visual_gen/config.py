@@ -73,7 +73,12 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
+    """Create state shared by TRTLLM attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures and owns the
+    shape-keyed TRTLLM metadata cache. Each VisualGen model component receives
+    a distinct cache.
+    """
     return {"metadata_cache": {}}
 
 
@@ -120,6 +125,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -185,6 +191,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None

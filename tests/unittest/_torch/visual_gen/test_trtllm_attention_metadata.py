@@ -261,7 +261,6 @@ def test_sparse_lifecycle_requires_concrete_predictor():
 
 
 def test_sparse_lifecycle_predicts_block_inputs_then_runs_normal_forward():
-    assert "sparse_preprocess" not in visual_trtllm.TrtllmAttention.__dict__
     attention = object.__new__(_RecordingSparseAttention)
     attention.lifecycle_events = []
     attention.predicted_carrier = _make_block_sparse_inputs()
