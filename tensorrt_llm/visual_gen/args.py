@@ -30,7 +30,11 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
+from .sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 # =============================================================================
 # Type aliases
@@ -89,7 +93,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -116,7 +120,8 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL / TRTLLM backends)."
+            "skip_softmax (TRTLLM / CUTEDSL backends), VSA (CUTEDSL / TRTLLM backends), "
+            "or SOL (TRTLLM backend)."
         ),
     )
 
@@ -180,6 +185,7 @@ class AttentionConfig(StrictBaseModel):
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
             "vsa": ("CUTEDSL", "TRTLLM"),
+            "sol_attn": ("TRTLLM",),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -202,6 +208,8 @@ class AttentionConfig(StrictBaseModel):
             # VSA consumes the unquantized Q/K/V path, so accepting an attention
             # quantization recipe would silently ignore user configuration.
             raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+        if self.sparse_attention_config.algorithm == "sol_attn":
+            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
         return self
 
 
@@ -667,6 +675,21 @@ class VisualGenArgs(StrictBaseModel):
             data = {**data, "quant_config": QuantConfig()}
         return data
 
+    @model_validator(mode="after")
+    def _validate_sol_fullgraph(self) -> "VisualGenArgs":
+        sparse_config = self.attention_config.sparse_attention_config
+        if (
+            isinstance(sparse_config, SolAttentionConfig)
+            and self.torch_compile_config.enable
+            and self.torch_compile_config.enable_fullgraph
+        ):
+            raise ValueError(
+                "SOL sparse attention does not support torch.compile fullgraph; "
+                "set torch_compile_config.enable_fullgraph=False or disable "
+                "torch.compile."
+            )
+        return self
+
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
         return self.cache_config.cache_backend if self.cache_config is not None else None  # type: ignore[return-value]
@@ -718,6 +741,7 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "SolAttentionConfig",
     "VideoSparseAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",

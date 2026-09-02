@@ -14,14 +14,16 @@
 # limitations under the License.
 """Base classes for VisualGen model components."""
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
@@ -35,6 +37,48 @@ class BaseDiffusionModel(nn.Module):
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
+        self._sol_timestep_arg_index = None
+        sparse_config = model_config.attention.sparse_attention_config
+        if isinstance(sparse_config, SolAttentionConfig) and (
+            sparse_config.disabled_until_timestep is not None
+        ):
+            self._sol_timestep_arg_index = next(
+                (
+                    index
+                    for index, parameter in enumerate(
+                        tuple(inspect.signature(type(self).forward).parameters.values())[1:]
+                    )
+                    if parameter.name == "timestep"
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ),
+                None,
+            )
+
+    def __call__(self, *args, **kwargs):
+        """Scope a timestep-derived SOL phase around one model forward."""
+
+        sparse_config = self.model_config.attention.sparse_attention_config
+        if not isinstance(sparse_config, SolAttentionConfig):
+            return super().__call__(*args, **kwargs)
+        cutoff = sparse_config.disabled_until_timestep
+        if cutoff is None:
+            return super().__call__(*args, **kwargs)
+        timestep = kwargs.get("timestep")
+        if (
+            "timestep" not in kwargs
+            and self._sol_timestep_arg_index is not None
+            and len(args) > self._sol_timestep_arg_index
+        ):
+            timestep = args[self._sol_timestep_arg_index]
+        with SolParams.model_forward_phase_scope(
+            timestep,
+            disabled_until_timestep=cutoff,
+        ):
+            return super().__call__(*args, **kwargs)
 
     def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
         """Run the diffusion transformer.
@@ -74,23 +118,37 @@ class BaseDiffusionModel(nn.Module):
         the shared registrations.
         """
         sparse_config = self.model_config.attention.sparse_attention_config
-        if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
+                pretrained_config=self.model_config.pretrained_config,
+            )
+            if disabled_until_timestep is None:
+                return
+
+            # Skip Softmax switches graph-visible attention behavior at the
+            # timestep boundary while tensor shapes stay unchanged. Key the dense
+            # and sparse phases separately; if timestep is absent or None, the
+            # scheduler returns None and the runner omits this key part.
+            runner.register_extra_key_fn(
+                "skip_softmax_phase",
+                lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                    kwargs.get("timestep"),
+                    disabled_until_timestep=disabled_until_timestep,
+                ),
+            )
             return
 
-        disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
-            pretrained_config=self.model_config.pretrained_config,
-        )
+        if not isinstance(sparse_config, SolAttentionConfig):
+            return
+        disabled_until_timestep = sparse_config.disabled_until_timestep
         if disabled_until_timestep is None:
             return
 
-        # Skip Softmax switches graph-visible attention behavior at the
-        # timestep boundary while tensor shapes stay unchanged. Key the dense
-        # and sparse phases separately; if timestep is absent or None, the
-        # scheduler returns None and the runner omits this key part.
-        runner.register_extra_key_fn(
-            "skip_softmax_phase",
-            lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-                kwargs.get("timestep"),
-                disabled_until_timestep=disabled_until_timestep,
-            ),
-        )
+        def _sol_graph_phase(*args, **kwargs) -> int | None:
+            del args, kwargs
+            phase = SolParams.get_scoped_graph_phase()
+            if phase is None:
+                raise RuntimeError("SOL graph key must be evaluated inside a model forward")
+            return phase
+
+        runner.register_extra_key_fn("sol_attn_phase", _sol_graph_phase)
