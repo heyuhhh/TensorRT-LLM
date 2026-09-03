@@ -13,9 +13,12 @@ Tests cover:
 Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 """
 
+import ast
 import gc
+import inspect
 import json
 import os
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +66,45 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
 GEMMA3_PATH = os.environ.get("LTX2_TEXT_ENCODER_PATH", _GEMMA3_DEFAULT)
+
+
+def _transformer_timestep_arguments(method) -> list[str | None]:
+    """Return simple-name timestep arguments passed to ``self.transformer``."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+    arguments = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "transformer"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "self"
+        ):
+            continue
+        timestep = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "timestep"),
+            None,
+        )
+        arguments.append(timestep.id if isinstance(timestep, ast.Name) else None)
+    return arguments
+
+
+@pytest.mark.cpu_only
+def test_ltx2_transformer_calls_use_actual_diffusion_timestep_for_sparse_phase():
+    """Both LTX-2 stages must drive sparse policy from sigma, not step index."""
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+        LTX2TwoStagesPipeline,
+    )
+
+    assert _transformer_timestep_arguments(LTX2Pipeline.forward) == ["timestep_val"]
+    assert _transformer_timestep_arguments(LTX2TwoStagesPipeline._refinement_denoise) == [
+        "timestep"
+    ]
 
 
 def _ltx2_pipeline_config(**overrides):
