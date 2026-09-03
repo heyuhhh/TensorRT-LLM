@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention_backend.block_sparse import BlockSparseForwardInputs
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
@@ -827,6 +828,131 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
         )
         assert backend._select_fmha(q, None, None, metadata, mask_data_args) is fallback
         assert len(backend._fmha_cache) == 2
+
+
+@pytest.mark.parametrize("block_sparse_first", [False, True])
+def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> None:
+    events: list[tuple] = []
+    backend = _make_fmha_cache_backend()
+    block_sparse_fmha = _TestFmha(
+        backend,
+        "block-sparse",
+        events,
+        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is not None,
+    )
+    dense_fmha = _TestFmha(
+        backend,
+        "dense",
+        events,
+        support_predicate=lambda forward_args: forward_args.block_sparse_inputs is None,
+    )
+    backend.fmha_libs = [block_sparse_fmha, dense_fmha]
+    metadata = _make_fmha_cache_metadata(
+        num_contexts=1,
+        num_generations=0,
+        num_ctx_tokens=1,
+    )
+    q = torch.empty((1, 4))
+    forward_args_by_mode = {
+        False: AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+        True: AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=torch.zeros((1, 1), dtype=torch.int32),
+            ),
+        ),
+    }
+    request_order = (True, False) if block_sparse_first else (False, True)
+
+    with patch.object(trtllm_backend, "_is_fmha_cache_enabled", return_value=True):
+        selected_by_mode = {
+            is_block_sparse: backend._select_fmha(
+                q,
+                None,
+                None,
+                metadata,
+                forward_args_by_mode[is_block_sparse],
+            )
+            for is_block_sparse in request_order
+        }
+        for is_block_sparse in request_order:
+            assert (
+                backend._select_fmha(
+                    q,
+                    None,
+                    None,
+                    metadata,
+                    forward_args_by_mode[is_block_sparse],
+                )
+                is selected_by_mode[is_block_sparse]
+            )
+
+    assert selected_by_mode == {
+        False: dense_fmha,
+        True: block_sparse_fmha,
+    }
+    assert len(backend._fmha_cache) == 2
+
+
+@pytest.mark.parametrize("bsr_first", [False, True])
+def test_fmha_cache_separates_block_sparse_representations(bsr_first: bool) -> None:
+    events: list[tuple] = []
+    backend = _make_fmha_cache_backend()
+    bsr_only = _TestFmha(
+        backend,
+        "bsr-only",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.block_sparse_inputs.sparse_format == "bsr"
+        ),
+    )
+    bitmask_only = _TestFmha(
+        backend,
+        "bitmask-only",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.block_sparse_inputs.sparse_format == "bitmask"
+        ),
+    )
+    backend.fmha_libs = [bsr_only, bitmask_only]
+    metadata = _make_fmha_cache_metadata(
+        num_contexts=1,
+        num_generations=0,
+        num_ctx_tokens=1,
+    )
+    q = torch.empty((1, 4))
+    bsr_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        block_sparse_inputs=BlockSparseForwardInputs(
+            q_block_size=64,
+            kv_block_size=64,
+            max_blocks_per_row=1,
+            block_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            block_indices=torch.tensor([0], dtype=torch.int32),
+        ),
+    )
+    bitmask_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        block_sparse_inputs=BlockSparseForwardInputs(
+            q_block_size=64,
+            kv_block_size=64,
+            exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+            k_summary=torch.empty((1, 1, 1, 128), dtype=torch.bfloat16),
+            v_summary=torch.empty((1, 1, 1, 128), dtype=torch.bfloat16),
+        ),
+    )
+    request_order = (bsr_args, bitmask_args) if bsr_first else (bitmask_args, bsr_args)
+
+    with patch.object(trtllm_backend, "_is_fmha_cache_enabled", return_value=True):
+        selected = [
+            backend._select_fmha(q, None, None, metadata, forward_args)
+            for forward_args in request_order
+        ]
+
+    assert selected == ([bsr_only, bitmask_only] if bsr_first else [bitmask_only, bsr_only])
+    assert len(backend._fmha_cache) == 2
 
 
 @pytest.mark.parametrize("speculative_first", [False, True])

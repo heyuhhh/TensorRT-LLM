@@ -131,6 +131,10 @@ class _FmhaCacheKey(NamedTuple):
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
+    has_block_sparse_inputs: bool
+    block_sparse_format: Optional[str]
+    block_sparse_use_proxy_routes: bool
+    block_sparse_has_kv_valid_bits: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: Optional[torch.dtype]
@@ -1641,6 +1645,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # Optional owner-supplied cache for sharing graph-stable PrimTS plans
+    # across attention layers that execute serially.
+    _block_sparse_fmha_cache_state: Optional[Dict[str, object]] = None
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
@@ -2097,12 +2104,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID)
 
+        block_sparse_inputs = forward_args.block_sparse_inputs
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
+            has_block_sparse_inputs=block_sparse_inputs is not None,
+            block_sparse_format=(block_sparse_inputs.sparse_format
+                                 if block_sparse_inputs is not None else None),
+            block_sparse_use_proxy_routes=(block_sparse_inputs.use_proxy_routes
+                                           if block_sparse_inputs is not None
+                                           else False),
+            block_sparse_has_kv_valid_bits=(
+                block_sparse_inputs is not None
+                and block_sparse_inputs.kv_valid_bits is not None),
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )
@@ -2268,6 +2285,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        has_block_sparse_inputs = forward_args.block_sparse_inputs is not None
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -2469,8 +2487,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
             if k is not None and not metadata.is_cross:
-                assert k.shape[0] == num_tokens
-                assert v.shape[0] == num_tokens
+                if has_block_sparse_inputs:
+                    assert v is not None and v.shape[0] == k.shape[0]
+                else:
+                    assert k.shape[0] == num_tokens
+                    assert v.shape[0] == num_tokens
         else:
             sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
