@@ -1763,6 +1763,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     video=video_mod,
                     audio=audio_mod,
                     text_cache=_s2_static,
+                    timestep=timestep,
                     step_index=i,
                 )
 
