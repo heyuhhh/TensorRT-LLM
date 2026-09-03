@@ -21,8 +21,9 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
@@ -44,6 +45,8 @@ class BaseDiffusionModel(nn.Module):
                 pretrained_config=self.pretrained_config,
             )
             self._skip_softmax_disabled_until_timestep = cutoff
+        elif isinstance(sparse_config, SolAttentionConfig):
+            cutoff = sparse_config.disabled_until_timestep
         else:
             cutoff = None
         if cutoff is not None:
@@ -70,6 +73,9 @@ class BaseDiffusionModel(nn.Module):
         if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
             cutoff = self._skip_softmax_disabled_until_timestep
             phase_scope = SkipSoftmaxScheduler.model_forward_phase_scope
+        elif isinstance(sparse_config, SolAttentionConfig):
+            cutoff = sparse_config.disabled_until_timestep
+            phase_scope = SolParams.model_forward_phase_scope
         else:
             cutoff = None
             phase_scope = None
@@ -148,3 +154,18 @@ class BaseDiffusionModel(nn.Module):
                 _skip_softmax_graph_phase,
             )
             return
+
+        if not isinstance(sparse_config, SolAttentionConfig):
+            return
+        disabled_until_timestep = sparse_config.disabled_until_timestep
+        if disabled_until_timestep is None:
+            return
+
+        def _sol_graph_phase(*args, **kwargs) -> int | None:
+            del args, kwargs
+            phase = SolParams.get_scoped_graph_phase()
+            if phase is None:
+                raise RuntimeError("SOL graph key must be evaluated inside a model forward")
+            return phase
+
+        runner.register_extra_key_fn("sol_attn_phase", _sol_graph_phase)
