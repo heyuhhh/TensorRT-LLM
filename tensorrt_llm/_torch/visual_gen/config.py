@@ -137,6 +137,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -204,6 +205,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
