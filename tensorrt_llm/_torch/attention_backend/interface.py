@@ -33,8 +33,8 @@ from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
 from .block_sparse import BlockSparseForwardInputs
-from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
-                            SparseRuntimeParams)
+from .sparse.params import (SparseAttentionPrediction, SparseBackendForwardArgs,
+                            SparseMetadataParams, SparseRuntimeParams)
 
 try:
     # Transformers v5
@@ -967,6 +967,7 @@ class AttentionForwardArgs:
 
     block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
+    sparse_attention_prediction: Optional[SparseAttentionPrediction] = None
     sparse_runtime_params: SparseRuntimeParams = field(
         default_factory=SparseRuntimeParams)
 

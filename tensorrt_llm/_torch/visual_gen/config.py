@@ -74,8 +74,22 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
-    return {"metadata_cache": {}}
+    """Create state shared by TRTLLM attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures and owns the
+    shape-keyed TRTLLM metadata and PrimTS plan caches. VisualGen attention
+    layers execute serially within one component, so sharing graph-stable route
+    workspaces avoids retaining one worst-case allocation per layer. Each model
+    component receives a distinct state and must not execute concurrent forwards.
+    """
+    return {
+        "metadata_cache": {},
+        "block_sparse_fmha_cache": {
+            "contiguous_wrappers": {},
+            "paged_wrappers": {},
+        },
+        "sparse_predictors": {},
+    }
 
 
 def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:

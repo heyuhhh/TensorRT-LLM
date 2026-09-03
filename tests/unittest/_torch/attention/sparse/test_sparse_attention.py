@@ -21,14 +21,17 @@ import math
 from dataclasses import dataclass
 from types import ModuleType
 from typing import List, Optional, Tuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend import block_sparse
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.sparse import hooks as sparse_hooks
+from tensorrt_llm._torch.attention_backend.sparse import params as sparse_params_module
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
@@ -271,6 +274,207 @@ def test_sparse_runtime_params_without_prediction() -> None:
     )
 
     assert runtime_params == SparseRuntimeParams()
+
+
+def _make_block_sparse_inputs() -> block_sparse.BlockSparseForwardInputs:
+    return block_sparse.BlockSparseForwardInputs(
+        q_block_size=64,
+        kv_block_size=64,
+        exact_block_bits=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+
+class _StopAfterShapeValidation(Exception):
+    pass
+
+
+def _make_sparse_prediction_forward_backend() -> TrtllmAttention:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.sparse_params = None
+    attention.is_mla_enable = False
+    attention.num_heads = 1
+    attention.num_kv_heads = 1
+    attention.head_dim = 4
+    attention.get_local_layer_idx = Mock(return_value=1)
+    attention._ensure_rope_table_size = Mock(side_effect=_StopAfterShapeValidation)
+    return attention
+
+
+def _make_sparse_prediction_forward_metadata() -> TrtllmAttentionMetadata:
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    seq_lens = torch.tensor([2], dtype=torch.int32)
+    metadata._seq_lens = seq_lens
+    metadata._seq_lens_kv = seq_lens
+    metadata._seq_lens_cuda = None
+    metadata.kv_cache_manager = None
+    metadata._max_seq_len_storage = 4
+    metadata.use_paged_context_fmha = False
+    metadata.cu_q_seqlens = None
+    metadata.cu_kv_seqlens = None
+    metadata.enable_flash_mla = False
+    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.kv_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.kv_lens_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.prompt_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.prompt_lens_cpu_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.host_request_types_runtime = torch.tensor([0], dtype=torch.int32)
+    return metadata
+
+
+def test_forward_materializes_dynamic_block_sparse_prediction_before_shape_validation() -> None:
+    attention = _make_sparse_prediction_forward_backend()
+    block_sparse_inputs = _make_block_sparse_inputs()
+    prediction = sparse_params_module.SparseAttentionPrediction(
+        runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([4])),
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    attention.predict_sparse_attention = Mock(return_value=prediction)
+    q = torch.empty((2, 4))
+    k = torch.empty((4, 4))
+    v = torch.empty((4, 4))
+    metadata = _make_sparse_prediction_forward_metadata()
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.context_only,
+    )
+
+    with pytest.raises(_StopAfterShapeValidation):
+        attention.forward(q, k, v, metadata, forward_args)
+
+    attention.predict_sparse_attention.assert_called_once_with(q, k, v, metadata, forward_args)
+    assert forward_args.sparse_runtime_params is prediction.runtime_params
+    assert forward_args.block_sparse_inputs is block_sparse_inputs
+
+
+@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+def test_forward_reuses_precomputed_sparse_attention_prediction(
+    has_block_sparse_inputs: bool,
+) -> None:
+    attention = _make_sparse_prediction_forward_backend()
+    attention.predict_sparse_attention = Mock()
+    block_sparse_inputs = _make_block_sparse_inputs() if has_block_sparse_inputs else None
+    prediction = sparse_params_module.SparseAttentionPrediction(
+        runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([2])),
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    q = torch.empty((2, 4))
+    num_kv_tokens = 4 if has_block_sparse_inputs else 2
+    k = torch.empty((num_kv_tokens, 4))
+    v = torch.empty((num_kv_tokens, 4))
+    metadata = _make_sparse_prediction_forward_metadata()
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.context_only,
+        sparse_attention_prediction=prediction,
+    )
+
+    for _ in range(2):
+        with pytest.raises(_StopAfterShapeValidation):
+            attention.forward(q, k, v, metadata, forward_args)
+
+    attention.predict_sparse_attention.assert_not_called()
+    assert attention._ensure_rope_table_size.call_count == 2
+    assert forward_args.sparse_runtime_params is prediction.runtime_params
+    assert forward_args.block_sparse_inputs is block_sparse_inputs
+
+
+def test_prepare_sparse_attention_prediction_runs_predictors_once() -> None:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.sparse_params = MockSparseParams()
+    sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
+    sparse_kv_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
+    sparse_attn_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    attention.sparse_kv_predict = Mock(return_value=(sparse_kv_indices, sparse_kv_offsets))
+    attention.sparse_attn_predict = Mock(return_value=(sparse_attn_indices, sparse_attn_offsets))
+    q = torch.empty((1, 4))
+    k = torch.empty((1, 4))
+    v = torch.empty((1, 4))
+    metadata = Mock()
+    sparse_attn_kv_lens = torch.tensor([3], dtype=torch.int32)
+    block_sparse_inputs = _make_block_sparse_inputs()
+    forward_args = AttentionForwardArgs(
+        block_sparse_inputs=block_sparse_inputs,
+        sparse_runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=sparse_attn_kv_lens),
+    )
+
+    with patch.object(
+        attention,
+        "predict_sparse_attention",
+        wraps=attention.predict_sparse_attention,
+    ) as predict_sparse_attention:
+        prediction = sparse_hooks.prepare_sparse_attention_prediction(
+            attention, q, k, v, metadata, forward_args
+        )
+
+    assert isinstance(prediction, sparse_params_module.SparseAttentionPrediction)
+    assert prediction.block_sparse_inputs is block_sparse_inputs
+    assert prediction.runtime_params.sparse_kv_indices is sparse_kv_indices
+    assert prediction.runtime_params.sparse_kv_offsets is sparse_kv_offsets
+    assert prediction.runtime_params.sparse_attn_indices is sparse_attn_indices
+    assert prediction.runtime_params.sparse_attn_offsets is sparse_attn_offsets
+    assert prediction.runtime_params.sparse_attn_indices_block_size == 1
+    assert prediction.runtime_params.sparse_attn_kv_lens is sparse_attn_kv_lens
+    predict_sparse_attention.assert_called_once_with(q, k, v, metadata, forward_args)
+    attention.sparse_kv_predict.assert_called_once_with(q, k, metadata, forward_args)
+    attention.sparse_attn_predict.assert_called_once_with(q, k, metadata, forward_args)
+
+
+@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+def test_prepare_sparse_attention_prediction_reuses_precomputed_result(
+    has_block_sparse_inputs: bool,
+) -> None:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.predict_sparse_attention = Mock()
+    block_sparse_inputs = _make_block_sparse_inputs() if has_block_sparse_inputs else None
+    prediction = sparse_params_module.SparseAttentionPrediction(
+        runtime_params=SparseRuntimeParams(),
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    forward_args = AttentionForwardArgs(sparse_attention_prediction=prediction)
+
+    result = sparse_hooks.prepare_sparse_attention_prediction(
+        attention,
+        torch.empty((1, 4)),
+        None,
+        None,
+        Mock(),
+        forward_args,
+    )
+
+    assert result is prediction
+    attention.predict_sparse_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("precomputed_has_block_sparse_inputs", [False, True])
+def test_prepare_sparse_attention_prediction_rejects_two_block_sparse_sources(
+    precomputed_has_block_sparse_inputs: bool,
+) -> None:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.predict_sparse_attention = Mock()
+    direct_block_sparse_inputs = _make_block_sparse_inputs()
+    prediction = sparse_params_module.SparseAttentionPrediction(
+        runtime_params=SparseRuntimeParams(),
+        block_sparse_inputs=(
+            _make_block_sparse_inputs() if precomputed_has_block_sparse_inputs else None
+        ),
+    )
+    forward_args = AttentionForwardArgs(
+        block_sparse_inputs=direct_block_sparse_inputs,
+        sparse_attention_prediction=prediction,
+    )
+
+    with pytest.raises(ValueError, match="block_sparse_inputs"):
+        sparse_hooks.prepare_sparse_attention_prediction(
+            attention,
+            torch.empty((1, 4)),
+            None,
+            None,
+            Mock(),
+            forward_args,
+        )
+
+    attention.predict_sparse_attention.assert_not_called()
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

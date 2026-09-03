@@ -14,6 +14,8 @@ from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional
 
+from .params import SparseAttentionPrediction
+
 if TYPE_CHECKING:
     import torch
 
@@ -29,6 +31,7 @@ __all__ = [
     "MLASparseHooks",
     "get_sparse_attention_hooks",
     "get_sparse_mla_hooks",
+    "prepare_sparse_attention_prediction",
     "prepare_sparse_runtime_params",
     "register_attention_sparse_hooks",
     "register_mla_sparse_hooks",
@@ -244,3 +247,26 @@ def prepare_sparse_runtime_params(
         sparse_attn_offsets=attn_offsets,
         sparse_attn_indices_block_size=block_size,
     )
+
+
+def prepare_sparse_attention_prediction(
+    backend: "TrtllmAttention",
+    q: "torch.Tensor",
+    k: Optional["torch.Tensor"],
+    v: Optional["torch.Tensor"],
+    metadata: "AttentionMetadata",
+    forward_args: "AttentionForwardArgs",
+) -> SparseAttentionPrediction:
+    """Return a precomputed prediction or invoke the backend predictor once."""
+    prediction = forward_args.sparse_attention_prediction
+    if prediction is not None:
+        if (
+            forward_args.block_sparse_inputs is not None
+            and forward_args.block_sparse_inputs is not prediction.block_sparse_inputs
+        ):
+            raise ValueError(
+                "block_sparse_inputs cannot be provided both directly and "
+                "through sparse_attention_prediction"
+            )
+        return prediction
+    return backend.predict_sparse_attention(q, k, v, metadata, forward_args)

@@ -51,8 +51,9 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         CustomAttentionMask, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
-from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.params import SparseParams
+from .sparse.hooks import (prepare_sparse_attention_prediction,
+                           prepare_sparse_runtime_params)
+from .sparse.params import SparseAttentionPrediction, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
 # Keep these general-purpose cache buckets aligned with the shape coverage used
@@ -2285,7 +2286,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        has_block_sparse_inputs = forward_args.block_sparse_inputs is not None
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -2432,8 +2432,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     seq_start=num_ctx,
                 )
 
-        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, metadata, forward_args)
+        sparse_attention_prediction = prepare_sparse_attention_prediction(
+            self, q, k, v, metadata, forward_args)
+        forward_args.sparse_runtime_params = sparse_attention_prediction.runtime_params
+        forward_args.block_sparse_inputs = sparse_attention_prediction.block_sparse_inputs
+        has_block_sparse_inputs = forward_args.block_sparse_inputs is not None
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
@@ -2567,14 +2570,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
-
-        sparse_params = self.sparse_params
-        if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.sparse_runtime_params = (
-                sparse_params.scheduler.get_runtime_params(
-                    runtime_params=forward_args.sparse_runtime_params,
-                    timestep=forward_args.timestep,
-                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
@@ -2796,6 +2791,29 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict sparse KV indices when required by an algorithm."""
         return None, None
+
+    def predict_sparse_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> SparseAttentionPrediction:
+        """Predict all sparse inputs for one attention call."""
+        del v
+        runtime_params = prepare_sparse_runtime_params(self, q, k, metadata,
+                                                       forward_args)
+        sparse_params = self.sparse_params
+        if isinstance(sparse_params, SkipSoftmaxParams):
+            runtime_params = sparse_params.scheduler.get_runtime_params(
+                runtime_params=runtime_params,
+                timestep=forward_args.timestep,
+            )
+        return SparseAttentionPrediction(
+            runtime_params=runtime_params,
+            block_sparse_inputs=forward_args.block_sparse_inputs,
+        )
 
     def sparse_attn_predict(
         self,

@@ -14,6 +14,7 @@
 # limitations under the License.
 """Base classes for VisualGen model components."""
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +36,58 @@ class BaseDiffusionModel(nn.Module):
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
+        self._sparse_timestep_arg_index = None
+        self._skip_softmax_disabled_until_timestep = None
+        sparse_config = model_config.attention.sparse_attention_config
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            cutoff = sparse_config.resolve_disabled_until_timestep(
+                pretrained_config=self.pretrained_config,
+            )
+            self._skip_softmax_disabled_until_timestep = cutoff
+        else:
+            cutoff = None
+        if cutoff is not None:
+            self._sparse_timestep_arg_index = next(
+                (
+                    index
+                    for index, parameter in enumerate(
+                        tuple(inspect.signature(type(self).forward).parameters.values())[1:]
+                    )
+                    if parameter.name == "timestep"
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ),
+                None,
+            )
+
+    def __call__(self, *args, **kwargs):
+        """Scope a timestep-derived sparse-attention phase around one model forward."""
+
+        sparse_config = self.model_config.attention.sparse_attention_config
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            cutoff = self._skip_softmax_disabled_until_timestep
+            phase_scope = SkipSoftmaxScheduler.model_forward_phase_scope
+        else:
+            cutoff = None
+            phase_scope = None
+        if cutoff is None:
+            return super().__call__(*args, **kwargs)
+        timestep = kwargs.get("timestep")
+        if (
+            "timestep" not in kwargs
+            and self._sparse_timestep_arg_index is not None
+            and len(args) > self._sparse_timestep_arg_index
+        ):
+            timestep = args[self._sparse_timestep_arg_index]
+        assert phase_scope is not None
+        with phase_scope(
+            timestep,
+            disabled_until_timestep=cutoff,
+        ):
+            return super().__call__(*args, **kwargs)
 
     def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
         """Run the diffusion transformer.
@@ -74,23 +127,24 @@ class BaseDiffusionModel(nn.Module):
         the shared registrations.
         """
         sparse_config = self.model_config.attention.sparse_attention_config
-        if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
-            return
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig):
+            disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
+                pretrained_config=self.model_config.pretrained_config,
+            )
+            if disabled_until_timestep is None:
+                return
 
-        disabled_until_timestep = sparse_config.resolve_disabled_until_timestep(
-            pretrained_config=self.model_config.pretrained_config,
-        )
-        if disabled_until_timestep is None:
-            return
+            def _skip_softmax_graph_phase(*args, **kwargs) -> int:
+                del args, kwargs
+                phase = SkipSoftmaxScheduler.get_scoped_graph_phase()
+                if phase is None:
+                    raise RuntimeError(
+                        "Skip-softmax graph key must be evaluated inside a model forward"
+                    )
+                return phase
 
-        # Skip Softmax switches graph-visible attention behavior at the
-        # timestep boundary while tensor shapes stay unchanged. Key the dense
-        # and sparse phases separately; if timestep is absent or None, the
-        # scheduler returns None and the runner omits this key part.
-        runner.register_extra_key_fn(
-            "skip_softmax_phase",
-            lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-                kwargs.get("timestep"),
-                disabled_until_timestep=disabled_until_timestep,
-            ),
-        )
+            runner.register_extra_key_fn(
+                "skip_softmax_phase",
+                _skip_softmax_graph_phase,
+            )
+            return
