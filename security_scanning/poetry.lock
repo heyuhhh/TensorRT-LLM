@@ -1413,14 +1413,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.16"
+version = "0.6.18"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.16-py3-none-any.whl", hash = "sha256:059d629cf352dae2d2e17c9b632f1be7c12fd7feb4979d71cdffd96104219e53"},
-    {file = "flashinfer_python-0.6.16.tar.gz", hash = "sha256:0c89970ee42b0640d3dfd65ea4770710e21101ce2b43a09eda3e29cd1874fe48"},
+    {file = "flashinfer_python-0.6.18-py3-none-any.whl", hash = "sha256:d5d26edb48f8def0bf28b2c94415aef7f0754e2cd9e3cb3d6e7081262d068aad"},
+    {file = "flashinfer_python-0.6.18.tar.gz", hash = "sha256:70a2074d78cb17ed39c98e5ed47f626c6e8bb29015cf028c49cbf8f2629405a1"},
 ]
 
 [package.dependencies]
@@ -1433,7 +1433,7 @@ nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
 nvidia-cudnn-frontend = ">=1.25.0"
-nvidia-cutlass-dsl = ">=4.5.0"
+nvidia-cutlass-dsl = ">=4.6.2a0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
 requests = "*"
@@ -1442,8 +1442,8 @@ torch = "*"
 tqdm = "*"
 
 [package.extras]
-cu12 = ["nvidia-cutlass-dsl (>=4.5.0)"]
-cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.5.0)"]
+cu12 = ["nvidia-cutlass-dsl (>=4.6.2a0)"]
+cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.6.2a0)"]
 
 [[package]]
 name = "frozenlist"
@@ -6968,4 +6968,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "5528db49d38814305d8c0039728a311855e3f0c95b1e4569cf54b7d349bd319d"
+content-hash = "ca0b0b91480976b5713c020c7e171ef8547c8290402c709a56f09bbe8cb7a854"
