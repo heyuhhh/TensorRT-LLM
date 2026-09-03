@@ -17,18 +17,21 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention as CoreTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
     _resolve_skip_softmax_threshold_scale_factor,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+    TrtllmAttention as VisualGenTrtllmAttention,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
-
-pytestmark = pytest.mark.cpu_only
 
 
 def _ckpt_sparse_attention_config(
@@ -87,6 +90,31 @@ def _prefill_threshold(
     ).threshold_scale_factor_prefill
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_precomputed_skip_softmax_phase_is_cuda_graph_safe():
+    scheduler = SkipSoftmaxScheduler(
+        threshold_scale_factor_prefill=5000.0,
+        disabled_until_timestep=0.6,
+    )
+    timestep = torch.tensor([0.0, 0.2], device="cuda")
+    source = torch.ones(1, device="cuda")
+
+    graph = torch.cuda.CUDAGraph()
+    with scheduler.model_forward_phase_scope(
+        timestep,
+        disabled_until_timestep=0.6,
+    ):
+        with torch.cuda.graph(graph):
+            runtime_params = scheduler.get_runtime_params(timestep=timestep)
+            captured = source + runtime_params.threshold_scale_factor_prefill
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, torch.full_like(captured, 5001.0))
+    assert SkipSoftmaxScheduler.get_scoped_graph_phase() is None
+
+
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxUserAPI:
     """User-facing config surface: VisualGen args only expose runtime knobs."""
 
@@ -209,6 +237,7 @@ attention_config:
         assert _prefill_threshold(sparse_params) == pytest.approx(5000.0)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxCheckpointConfig:
     """Checkpoint metadata: ModelOpt calibration is consumed at lowering time."""
 
@@ -308,6 +337,7 @@ class TestVisualGenSkipSoftmaxCheckpointConfig:
             config.to_sparse_params(checkpoint_config=checkpoint_config)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxLayerFiltering:
     """Layer filtering: checkpoint ignore patterns disable selected modules."""
 
@@ -346,6 +376,7 @@ class TestVisualGenSkipSoftmaxLayerFiltering:
         ) == pytest.approx(5000.0)
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxTimestepCutoff:
     """Timestep cutoff: early denoising can run with skip-softmax disabled."""
 
@@ -410,7 +441,193 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
             == expected
         )
 
+    @pytest.mark.parametrize(
+        ("timestep", "expected"),
+        [
+            (torch.tensor([0.0, 0.8]), 0),
+            (torch.tensor([0.0, 0.2]), 1),
+        ],
+    )
+    def test_graph_phase_waits_for_every_token_to_cross_cutoff(
+        self,
+        timestep,
+        expected,
+    ):
+        assert (
+            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                timestep,
+                disabled_until_timestep=0.6,
+            )
+            == expected
+        )
 
+    @pytest.mark.parametrize("pass_timestep_by_keyword", [False, True])
+    def test_model_forward_resolves_skip_softmax_phase_once(
+        self,
+        monkeypatch,
+        pass_timestep_by_keyword,
+    ):
+        sparse_params = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+            disabled_until_timestep=0.6,
+        ).to_sparse_params()
+
+        class _Model(BaseDiffusionModel):
+            def forward(self, hidden_states, timestep=None):
+                return (
+                    hidden_states,
+                    sparse_params.scheduler.get_runtime_params(timestep=timestep),
+                    sparse_params.scheduler.get_runtime_params(timestep=timestep),
+                    SkipSoftmaxScheduler.get_scoped_graph_phase(),
+                )
+
+        model = _Model(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(),
+                attention=AttentionConfig(
+                    backend="TRTLLM",
+                    sparse_attention_config=SkipSoftmaxAttentionConfig(
+                        threshold_scale_factor=5000.0,
+                        disabled_until_timestep=0.6,
+                    ),
+                ),
+            )
+        )
+        original_item = torch.Tensor.item
+        item_calls = 0
+
+        def _count_item(tensor, *args, **kwargs):
+            nonlocal item_calls
+            item_calls += 1
+            return original_item(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "item", _count_item)
+        timestep = torch.tensor([0.0, 0.2])
+        if pass_timestep_by_keyword:
+            _, first, second, scoped_phase = model(
+                torch.ones(1),
+                timestep=timestep,
+            )
+        else:
+            _, first, second, scoped_phase = model(torch.ones(1), timestep)
+
+        assert item_calls == 1
+        assert first.threshold_scale_factor_prefill == pytest.approx(5000.0)
+        assert second.threshold_scale_factor_prefill == pytest.approx(5000.0)
+        assert scoped_phase == 1
+        assert SkipSoftmaxScheduler.get_scoped_graph_phase() is None
+
+    def test_scoped_visual_phase_does_not_gate_scheduler_without_cutoff(self):
+        static_scheduler = SkipSoftmaxScheduler(threshold_scale_factor_prefill=123.0)
+
+        with SkipSoftmaxScheduler.model_forward_phase_scope(
+            0.8,
+            disabled_until_timestep=0.6,
+        ):
+            runtime_params = static_scheduler.get_runtime_params()
+
+        assert runtime_params.threshold_scale_factor_prefill == pytest.approx(123.0)
+
+    def test_skip_softmax_requires_precomputed_phase_during_capture(self, monkeypatch):
+        scheduler = SkipSoftmaxScheduler(
+            threshold_scale_factor_prefill=5000.0,
+            disabled_until_timestep=0.6,
+        )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+        with pytest.raises(RuntimeError, match="precomputed"):
+            scheduler.get_runtime_params(timestep=torch.tensor(0.2))
+
+
+@pytest.mark.cpu_only
+class TestVisualGenSkipSoftmaxTrtllm:
+    """TRTLLM keeps SkipSoftmax scheduling in the shared core backend."""
+
+    @staticmethod
+    def _patch_visual_trtllm_init(monkeypatch):
+        def _base_init(self, **kwargs):
+            self.sparse_params = kwargs["sparse_params"]
+
+        monkeypatch.setattr(VisualGenTrtllmAttention, "__init__", _base_init)
+
+    def test_factory_builds_thin_backend_with_shared_predictor(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+        sparse_params = attention_config.sparse_attention_config.to_sparse_params()
+
+        backend = create_attention(
+            backend="TRTLLM",
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            attention_config=attention_config,
+            attention_metadata_state={},
+            sparse_params=sparse_params,
+        )
+
+        backend_cls = type(backend)
+        assert backend_cls.__name__ == "SkipSoftmaxTrtllmAttention"
+        assert backend_cls.__module__.endswith(".sparse.skip_softmax.backend")
+        assert backend.sparse_params is sparse_params
+        assert (
+            backend.predict_sparse_attention.__func__
+            is CoreTrtllmAttention.predict_sparse_attention
+        )
+        assert "predict_sparse_attention" not in backend_cls.__dict__
+        assert "block_sparse_attn_predict" not in backend_cls.__dict__
+        assert "forward" not in backend_cls.__dict__
+        assert "scheduler" not in backend_cls.__dict__
+
+    def test_factory_keeps_ignored_skip_softmax_layer_dense(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+
+        backend = create_attention(
+            backend="TRTLLM",
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            attention_config=attention_config,
+            attention_metadata_state={},
+            sparse_params=None,
+        )
+
+        assert type(backend) is VisualGenTrtllmAttention
+        assert backend.sparse_params is None
+
+    def test_factory_rejects_invalid_skip_softmax_params(self, monkeypatch):
+        self._patch_visual_trtllm_init(monkeypatch)
+        attention_config = AttentionConfig(
+            backend="TRTLLM",
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+            ),
+        )
+
+        with pytest.raises(TypeError, match="requires SkipSoftmaxParams"):
+            create_attention(
+                backend="TRTLLM",
+                layer_idx=0,
+                num_heads=2,
+                head_dim=8,
+                attention_config=attention_config,
+                attention_metadata_state={},
+                sparse_params=object(),
+            )
+
+
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxCuTeDSL:
     """CuTeDSL lowering and runtime scheduling use the shared SkipSoftmax params."""
 
@@ -479,7 +696,16 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
                 sparse_attention_config=sparse_config,
             ),
         )
-        model = BaseDiffusionModel(model_config)
+
+        class _Model(BaseDiffusionModel):
+            phase_fn = None
+
+            def forward(self, hidden_states, *, timestep=None):
+                del hidden_states, timestep
+                assert self.phase_fn is not None
+                return self.phase_fn()
+
+        model = _Model(model_config)
 
         class _Runner:
             def __init__(self):
@@ -492,8 +718,12 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         model.register_cuda_graph_extra_key_fns(runner)
 
         phase_fn = runner.extra_key_fns["skip_softmax_phase"]
-        assert phase_fn(timestep=0.6) == 0
-        assert phase_fn(timestep=0.59) == 1
+        model.phase_fn = phase_fn
+        assert model(torch.ones(1), timestep=torch.tensor(0.6)) == 0
+        assert model(torch.ones(1), timestep=torch.tensor(0.59)) == 1
+        assert SkipSoftmaxScheduler.get_scoped_graph_phase() is None
+        with pytest.raises(RuntimeError, match="inside a model forward"):
+            phase_fn()
 
     @pytest.mark.skipif(
         cute_dsl_fmha._cute_dsl_import_error is not None,
@@ -544,6 +774,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         assert captured_kwargs.get("sparse_params") is sparse_params
 
 
+@pytest.mark.cpu_only
 class TestVisualGenSkipSoftmaxPipelineConfig:
     """Pipeline config: multi-transformer checkpoints keep metadata separated."""
 

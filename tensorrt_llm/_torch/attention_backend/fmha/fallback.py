@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     {
         "sparse_backend_args",  # consumed by sparse prediction before the attention op
+        "sparse_attention_prediction",  # consumed by sparse prediction before the attention op
         "block_sparse_inputs",  # consumed by the selected FMHA library
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path

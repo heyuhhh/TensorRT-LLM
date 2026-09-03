@@ -14,6 +14,9 @@
 # limitations under the License.
 """Skip-softmax parameter and calibration types."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
@@ -28,6 +31,10 @@ from ..params import SparseParams, SparseRuntimeParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
+_SCOPED_GRAPH_PHASE: ContextVar[int | None] = ContextVar(
+    "skip_softmax_scoped_graph_phase",
+    default=None,
+)
 
 
 def _is_skip_softmax_group(group: Dict[str, Any]) -> bool:
@@ -354,9 +361,15 @@ class SkipSoftmaxScheduler:
         if value is None:
             return None
         if isinstance(value, torch.Tensor):
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Skip-softmax graph phase must be precomputed before CUDA Graph capture"
+                )
             if value.numel() == 0:
                 return None
-            return float(value.flatten()[0].item())
+            # WAN I2V can carry one timestep per token, with reference tokens
+            # fixed at zero. Stay dense until every live token crosses the cutoff.
+            return float(value.amax().item())
         return float(value)
 
     @classmethod
@@ -374,6 +387,36 @@ class SkipSoftmaxScheduler:
             return None
         return int(timestep_value < disabled_until_timestep)
 
+    @staticmethod
+    def get_scoped_graph_phase() -> Optional[int]:
+        """Return the phase active for the current model forward, if any."""
+
+        return _SCOPED_GRAPH_PHASE.get()
+
+    @classmethod
+    @contextmanager
+    def model_forward_phase_scope(
+        cls,
+        timestep: Any,
+        *,
+        disabled_until_timestep: float,
+    ) -> Iterator[int]:
+        """Resolve skip-softmax phase once and scope it to one model forward."""
+
+        phase = cls.get_graph_phase_for_timestep(
+            timestep,
+            disabled_until_timestep=disabled_until_timestep,
+        )
+        if phase is None:
+            raise ValueError(
+                "timestep is required when skip-softmax disabled_until_timestep is configured"
+            )
+        token = _SCOPED_GRAPH_PHASE.set(phase)
+        try:
+            yield phase
+        finally:
+            _SCOPED_GRAPH_PHASE.reset(token)
+
     def get_runtime_params(
         self,
         *,
@@ -383,13 +426,15 @@ class SkipSoftmaxScheduler:
         """Return runtime parameters with skip-softmax thresholds."""
         if runtime_params is None:
             runtime_params = SparseRuntimeParams()
-        if (
-            self.get_graph_phase_for_timestep(
+        graph_phase = (
+            self.get_scoped_graph_phase() if self.disabled_until_timestep is not None else None
+        )
+        if graph_phase is None:
+            graph_phase = self.get_graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )
-            == 0
-        ):
+        if graph_phase == 0:
             return replace(
                 runtime_params,
                 threshold_scale_factor_prefill=0.0,

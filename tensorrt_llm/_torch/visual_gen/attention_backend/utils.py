@@ -114,7 +114,22 @@ def create_attention(
     Returns:
         AttentionBackend instance
     """
-    attn_cls = get_visual_gen_attention_backend(backend)
+    sparse_attention_config = (
+        attention_config.sparse_attention_config if attention_config is not None else None
+    )
+    is_skip_softmax = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "skip_softmax"
+    )
+    sparse_params = kwargs.get("sparse_params")
+
+    backend_name = backend.upper()
+    if is_skip_softmax and backend_name == "TRTLLM" and sparse_params is not None:
+        from .sparse.skip_softmax.backend import SkipSoftmaxTrtllmAttention
+
+        attn_cls = SkipSoftmaxTrtllmAttention
+    else:
+        attn_cls = get_visual_gen_attention_backend(backend)
 
     # Forward the validated quantization recipe to TRTLLM or the dense CuTe DSL FMHA backend.
     if attention_config is not None and attention_config.quant_attention_config is not None:

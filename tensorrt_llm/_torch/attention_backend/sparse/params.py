@@ -14,10 +14,12 @@
 # limitations under the License.
 """Shared sparse attention parameter types."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+
+from ..block_sparse import BlockSparseForwardInputs
 
 
 class SparseParams:
@@ -57,3 +59,20 @@ class SparseRuntimeParams:
     threshold_scale_factor_prefill: float = 0.0
     # SkipSoftmax decode threshold; diffusion models leave it at zero.
     threshold_scale_factor_decode: float = 0.0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SparseAttentionPrediction:
+    """Complete sparse inputs predicted for one attention call."""
+
+    runtime_params: SparseRuntimeParams = field(default_factory=SparseRuntimeParams)
+    block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
+
+
+__all__ = [
+    "SparseAttentionPrediction",
+    "SparseBackendForwardArgs",
+    "SparseMetadataParams",
+    "SparseParams",
+    "SparseRuntimeParams",
+]
