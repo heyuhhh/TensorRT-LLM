@@ -126,6 +126,10 @@ def create_attention(
         sparse_attention_config is not None
         and getattr(sparse_attention_config, "algorithm", None) == "vsa"
     )
+    is_sol = (
+        sparse_attention_config is not None
+        and getattr(sparse_attention_config, "algorithm", None) == "sol_attn"
+    )
     is_skip_softmax_config = (
         sparse_attention_config is not None
         and getattr(sparse_attention_config, "algorithm", None) == "skip_softmax"
@@ -150,6 +154,10 @@ def create_attention(
         from .sparse.vsa.backend import VSATrtllmAttention
 
         attn_cls = VSATrtllmAttention
+    elif is_sol and backend_name == "TRTLLM":
+        from .sparse.sol.backend import SOLTrtllmAttention
+
+        attn_cls = SOLTrtllmAttention
     elif is_skip_softmax and backend_name == "TRTLLM":
         from .sparse.skip_softmax.backend import SkipSoftmaxTrtllmAttention
 
