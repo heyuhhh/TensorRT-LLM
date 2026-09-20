@@ -407,7 +407,7 @@ def _make_config(
     num_heads: int,
     head_dim: int,
     backend: str,
-    vsa_sparsity: "float | None" = None,
+    vsa_sparsity: float | None = None,
 ) -> DiffusionModelConfig:
     """Minimal DiffusionModelConfig for one Attention module."""
     pretrained_config = SimpleNamespace(
@@ -497,7 +497,7 @@ def test_plain_trtllm_separate_qkv_dispatches_by_attention_role(
     assert attention.attn_backend == expected_backend
 
 
-def test_vsa_with_attn2d_raises():
+def test_vsa_with_attn2d_raises() -> None:
     """VSA + Attention2D must error at construction (VSA needs the full sequence per rank)."""
     pretrained_config = SimpleNamespace(
         hidden_size=64,
@@ -603,7 +603,7 @@ def test_vsa_graph_stable_caches_keep_every_shape_profile() -> None:
     ],
     ids=["clean_8x8x8", "ragged_9x9x9", "wan720p_21x45x80"],
 )
-def test_vsa_tile_untile_roundtrip(latent_shape):
+def test_vsa_tile_untile_roundtrip(latent_shape: tuple[int, int, int]) -> None:
     """Tiling then untiling must reproduce the input, and pooled cubes must be token means."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -751,7 +751,7 @@ def test_vsa_predictor_replays_inside_cuda_graph() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
-def test_cute_kernel_matches_dense_at_full_topk():
+def test_cute_kernel_matches_dense_at_full_topk() -> None:
     """CuTe block-sparse kernel matches dense SDPA when every cube is selected."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
         CUTE_AVAILABLE,
@@ -803,7 +803,7 @@ def test_cute_kernel_matches_dense_at_full_topk():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
-def test_cute_kernel_matches_ref_with_independent_indices():
+def test_cute_kernel_matches_ref_with_independent_indices() -> None:
     """CuTe kernel: paired Q-blocks (2i, 2i+1) attend to independent KV index lists."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
         CUTE_AVAILABLE,
@@ -886,7 +886,7 @@ def test_cute_kernel_matches_ref_with_independent_indices():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
-def test_cute_kernel_50pct_sparsity_quality_vs_dense():
+def test_cute_kernel_50pct_sparsity_quality_vs_dense() -> None:
     """50% sparse CuTe kernel with score-based topk stays close to dense SDPA."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
         CUTE_AVAILABLE,
@@ -960,7 +960,7 @@ def test_cute_kernel_50pct_sparsity_quality_vs_dense():
     [1, 3, 9],
     ids=["1cube_odd", "3cubes_odd", "9cubes_odd"],
 )
-def test_cute_kernel_odd_num_cubes_correctness(num_cubes):
+def test_cute_kernel_odd_num_cubes_correctness(num_cubes: int) -> None:
     """CuTe kernel supports a final Q block that has no paired neighbor."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
         CUTE_AVAILABLE,
