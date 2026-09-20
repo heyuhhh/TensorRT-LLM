@@ -562,25 +562,35 @@ def test_vsa_metadata_exposes_tile_source_index_and_packed_kv_words() -> None:
     assert metadata.kv_valid_words.tolist() == [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF, 0]
 
 
-def test_vsa_graph_stable_caches_bound_shape_profiles() -> None:
-    builder = VSAMetadataBuilder(max_cached_shapes=1)
+def test_vsa_graph_stable_caches_keep_every_shape_profile() -> None:
+    """Every distinct shape stays cached, matching the unbounded CUDA Graph set."""
+    builder = VSAMetadataBuilder()
     build_args = {
         "current_timestep": 0,
         "patch_size": (1, 1, 1),
         "vsa_sparsity": 0.5,
         "device": torch.device("cpu"),
     }
-    builder.build(raw_latent_shape=(4, 4, 4), **build_args)
-    with pytest.raises(RuntimeError, match="metadata cache reached its 1-shape limit"):
-        builder.build(raw_latent_shape=(8, 4, 4), **build_args)
+    shapes = [(4, 4, 4 * (index + 1)) for index in range(20)]
+    first = [builder.build(raw_latent_shape=shape, **build_args) for shape in shapes]
+    second = [builder.build(raw_latent_shape=shape, **build_args) for shape in shapes]
+    assert len(builder._cache) == len(shapes)
+    for before, after in zip(first, second):
+        assert after.tile_source_index is before.tile_source_index
 
-    route_builder = VSAPredictor(num_heads=1, max_cached_shapes=1)._route_builder
+    route_builder = VSAPredictor(num_heads=1)._route_builder
     kv_valid_words = torch.ones((1,), dtype=torch.uint32)
-    route_builder.from_selected_blocks(torch.zeros((1, 1, 1, 1), dtype=torch.int32), kv_valid_words)
-    with pytest.raises(RuntimeError, match="route cache reached its 1-shape limit"):
+    routes = [
         route_builder.from_selected_blocks(
-            torch.zeros((1, 1, 2, 1), dtype=torch.int32), kv_valid_words
+            torch.zeros((1, 1, num_q_blocks, 1), dtype=torch.int32), kv_valid_words
         )
+        for num_q_blocks in range(1, 21)
+    ]
+    assert len(route_builder._indptr_cache) == 20
+    again = route_builder.from_selected_blocks(
+        torch.zeros((1, 1, 7, 1), dtype=torch.int32), kv_valid_words
+    )
+    assert again.block_indptr is routes[6].block_indptr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
