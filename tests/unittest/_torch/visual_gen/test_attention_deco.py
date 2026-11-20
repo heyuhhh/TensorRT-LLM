@@ -197,7 +197,8 @@ def test_deco_layers_share_one_workspace() -> None:
 
 
 def test_deco_delegates_unsupported_calls() -> None:
-    """Cross-attention, masks and other dtypes run on VANILLA, unquantized."""
+    """Cross-attention, masks that are not a valid prefix and other dtypes run on VANILLA; a causal
+    mask runs on the dense CuTe DSL FMHA; all unquantized."""
     device = _require_deco_gpu()
     num_heads = 2
     q, k, v = _random_qkv(1, 256, num_heads, device)
@@ -210,8 +211,9 @@ def test_deco_delegates_unsupported_calls() -> None:
     out = attn.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
     assert _relative_error(out, _sdpa(q, k, v, is_causal=True)) < 2e-2
 
+    # valid keys that are not a prefix
     key_padding_mask = torch.ones(1, 256, dtype=torch.bool, device=device)
-    key_padding_mask[:, 200:] = False
+    key_padding_mask[:, 100:140] = False
     out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
     ref = _sdpa(q, k, v, attn_mask=key_padding_mask[:, None, None, :])
     assert _relative_error(out, ref) < 2e-2
@@ -225,9 +227,12 @@ def test_deco_delegates_unsupported_calls() -> None:
     assert attn._noted_unquantized
 
 
-def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
+def test_deco_token_tags_and_valid_prefixes() -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
-    text and audio tokens and none from the padding; the rows are drawn once per tags tensor."""
+    text and audio tokens and none from the padding, drawn once per tags tensor. A padded
+    sequence runs on its valid prefix, from the caller's host length or from a key-padding mask
+    whose valid keys lead every batch row (per row when they differ), with zeros on the padded
+    rows and the token tags of the prefix; the kernels run, not VANILLA."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 
     device = _require_deco_gpu()
@@ -242,8 +247,8 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
 
     out = attn.forward(q, k, v, token_tags=token_tags)
 
-    ((kept_tags, rows),) = state["deco_tagged_rows"]
-    assert kept_tags is token_tags
+    ((kept_tags, length, rows),) = state["deco_tagged_rows"]
+    assert kept_tags is token_tags and length == seq_len
     drawn = token_tags[rows.long()]
     assert (drawn >= 0).all()
     assert int((drawn > 0).sum()) == rows.numel() // 2
@@ -259,6 +264,40 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     assert len(state["deco_tagged_rows"]) == 1
     with pytest.raises(ValueError, match="token tags"):
         attn.forward(q, k, v, token_tags=token_tags[:-1])
+
+    # Padded sequences: the valid prefix of every row, from the host length or a prefix mask.
+    q, k, v = _random_qkv(2, 384, num_heads, device, q_scale=4.0)
+    attn = _backend(num_heads)
+
+    def check(out: torch.Tensor, lengths: list[int]) -> None:
+        assert out.shape == q.shape and torch.isfinite(out).all()
+        for b, n in enumerate(lengths):
+            ref = _sdpa(q[b : b + 1, :n], k[b : b + 1, :n], v[b : b + 1, :n])
+            uniform = v[b : b + 1, :n].float().mean(dim=1, keepdim=True).expand_as(ref)
+            assert _relative_error(out[b : b + 1, :n], ref) < max(
+                0.5 * _relative_error(uniform, ref), 0.02
+            )
+            assert not out[b, n:].any()
+
+    out = attn.forward(q, k, v, valid_seq_len=300, discard_padded_queries=True)
+    check(out, [300, 300])
+    assert "deco_workspace" in attn._state
+
+    mask = torch.ones(2, 384, dtype=torch.bool, device=device)
+    mask[0, 300:] = False
+    assert torch.equal(attn.forward(q, k, v, key_padding_mask=mask[:1].expand(2, -1)), out)
+    mask[1, 200:] = False
+    check(attn.forward(q, k, v, key_padding_mask=mask), [300, 200])
+    mask[1, 50] = False  # the lengths of a mask are read once and kept per mask tensor
+    assert len(attn._state["deco_prefix_lengths"]) == 2
+
+    # the token tags of the padded sequence: the rows are drawn on each row's prefix
+    token_tags = torch.zeros(384, dtype=torch.int32, device=device)
+    token_tags[250:] = 1  # text, padded at the end
+    mask[1, 50] = True
+    check(attn.forward(q, k, v, key_padding_mask=mask, token_tags=token_tags), [300, 200])
+    lengths = sorted(length for _, length, _ in attn._state["deco_tagged_rows"])
+    assert lengths == [200, 300]
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)

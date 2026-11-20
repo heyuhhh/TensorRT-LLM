@@ -521,11 +521,11 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
 
     seen = []
 
-    def launch(self, q, k, v, token_tags=None):
+    def attend(self, q, k, v, out, token_tags):
         seen.append(token_tags)
-        return torch.zeros_like(q)
+        out.zero_()
 
-    monkeypatch.setattr(DeCoAttention, "_launch", launch)
+    monkeypatch.setattr(DeCoAttention, "_attend", attend)
     inputs = _model_inputs("cuda")
     with torch.inference_mode():
         model(**inputs)

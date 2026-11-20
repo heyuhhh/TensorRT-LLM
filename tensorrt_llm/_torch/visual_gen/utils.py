@@ -368,3 +368,20 @@ class SequenceSharder:
             idx[dim] = slice(0, unpad_to)
             out = out[tuple(idx)]
         return out
+
+
+def joint_token_tags(
+    cache: dict, text_len: int, image_len: int, device: torch.device, text_first: bool = True
+) -> torch.Tensor:
+    """The modality of every token of a joint text and image sequence, int32 ``[S]`` with 1 on
+    the text tokens and 0 on the image tokens, for the attention backends (``token_tags`` of
+    ``AttentionBackend.forward``). Kept in ``cache`` per shape and device, so that a request's
+    forwards pass one tensor: a backend keeps work per tags tensor, and a CUDA graph replays
+    with the tensor it was captured with."""
+    key = (text_len, image_len, text_first, str(device))
+    tags = cache.get(key)
+    if tags is None:
+        text = torch.ones(text_len, dtype=torch.int32, device=device)
+        image = torch.zeros(image_len, dtype=torch.int32, device=device)
+        tags = cache[key] = torch.cat([text, image] if text_first else [image, text])
+    return tags

@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder, joint_token_tags
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
@@ -688,6 +688,7 @@ class QwenJointAttention(Attention):
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_txt = encoder_hidden_states.shape[1]
 
@@ -699,7 +700,7 @@ class QwenJointAttention(Attention):
         )
 
         if attention_mask is None or self._supports_key_padding_mask:
-            attn_kwargs = {}
+            attn_kwargs = {"token_tags": token_tags}
             if attention_mask is not None:
                 attn_kwargs["key_padding_mask"] = attention_mask
             out = self._attn_impl(joint_q, joint_k, joint_v, timestep=timestep, **attn_kwargs)
@@ -836,6 +837,7 @@ class QwenImageTransformerBlock(nn.Module):
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
@@ -855,6 +857,7 @@ class QwenImageTransformerBlock(nn.Module):
             fused_rotary_emb=fused_rotary_emb,
             attention_mask=attention_mask,
             timestep=timestep,
+            token_tags=token_tags,
         )
 
         # Residual.
@@ -973,6 +976,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             num_attention_heads=local_num_heads,
             num_kv_heads=local_num_heads,
         )
+        self._token_tags: dict = {}  # per shape: utils.joint_token_tags
 
         self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
@@ -1345,6 +1349,11 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         ):
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
 
+        # The modality of every token of the whole joint sequence, which the attention backends
+        # see under sequence parallelism too.
+        token_tags = joint_token_tags(
+            self._token_tags, text_seq_len, image_seq_len, hidden_states.device
+        )
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -1354,6 +1363,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 fused_rotary_emb=fused_rotary_emb,
                 attention_mask=block_attention_mask,
                 timestep=timestep,
+                token_tags=token_tags,
             )
 
         hidden_states = self.sharder.gather(hidden_states, dim=1, unpad_to=image_seq_len)

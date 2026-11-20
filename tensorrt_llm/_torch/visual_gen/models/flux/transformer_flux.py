@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnM
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder, joint_token_tags
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -641,6 +641,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 24)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
+        self._token_tags: dict = {}  # per shape: utils.joint_token_tags
 
         # Extract pretrained config from model_config
         pretrained_config = model_config.pretrained_config
@@ -881,6 +882,15 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             txt_ids = txt_ids[0]
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
+
+        # The modality of every token of the whole joint sequence, which the attention backends
+        # see under sequence parallelism too.
+        joint_attention_kwargs["token_tags"] = joint_token_tags(
+            self._token_tags,
+            encoder_hidden_states.shape[1],
+            hidden_states.shape[1],
+            hidden_states.device,
+        )
 
         # Shard sequences and position IDs before RoPE (no-op when sharder is inactive).
         img_ids = self.sharder.shard(img_ids, dim=0)

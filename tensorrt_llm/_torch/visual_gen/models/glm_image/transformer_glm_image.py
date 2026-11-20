@@ -29,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMod
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import joint_token_tags
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
@@ -400,6 +401,7 @@ class GlmImageAttention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Only VANILLA honors key_padding_mask; TRTLLM and CUTEDSL drop it, and FA4
         # reads it as a valid prefix while the pipeline left-pads.
@@ -455,7 +457,9 @@ class GlmImageAttention(Attention):
             mix_attn_mask[:, :text_seq_length] = text_attn_mask.bool().to(query.device)
             attention_mask = mix_attn_mask
 
-        hidden_states = self._attn_impl(query, key, value, key_padding_mask=attention_mask)
+        hidden_states = self._attn_impl(
+            query, key, value, key_padding_mask=attention_mask, token_tags=token_tags
+        )
 
         hidden_states = hidden_states.to(query.dtype)
 
@@ -510,6 +514,7 @@ class GlmImageTransformerBlock(torch.nn.Module):
         ] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Timestep conditioning
         (
@@ -533,6 +538,7 @@ class GlmImageTransformerBlock(torch.nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             attention_mask=attention_mask,
+            token_tags=token_tags,
             **attention_kwargs,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa.unsqueeze(1)
@@ -680,6 +686,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         )
 
         self.gradient_checkpointing = False
+        self._token_tags: dict = {}  # per shape: utils.joint_token_tags
 
         self.apply_quant_config_exclude_modules()
         self.__post_init__()
@@ -752,6 +759,13 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
 
         # 3. Transformer blocks
+        # the modality of every token of the joint sequence, for the attention backends
+        token_tags = joint_token_tags(
+            self._token_tags,
+            encoder_hidden_states.shape[1],
+            hidden_states.shape[1],
+            hidden_states.device,
+        )
         for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
@@ -771,6 +785,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
                     image_rotary_emb,
                     attention_mask,
                     attention_kwargs,
+                    token_tags=token_tags,
                 )
 
         # 4. Output norm & projection

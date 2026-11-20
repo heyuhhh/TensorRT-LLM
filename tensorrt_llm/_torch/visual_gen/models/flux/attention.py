@@ -347,6 +347,7 @@ class FluxJointAttention(Attention):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
         qkv_hidden_states: Optional[Union[torch.Tensor, Fp4QuantizedTensor]] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of joint attention.
 
@@ -355,6 +356,8 @@ class FluxJointAttention(Attention):
             encoder_hidden_states: Text tokens [batch, txt_seq, dim] (for dual-stream)
             attention_mask: Optional attention mask (unused, for API compat)
             image_rotary_emb: Tuple of (cos, sin) for RoPE
+            token_tags: Modality of every token of the joint sequence ``[txt_seq + img_seq]``,
+                for attention backends that sample tokens by modality
 
         Returns:
             For dual-stream: Tuple of (img_attn_output, txt_attn_output)
@@ -377,6 +380,8 @@ class FluxJointAttention(Attention):
         )
 
         attention_kwargs = {"timestep": timestep}
+        if token_tags is not None:
+            attention_kwargs["token_tags"] = token_tags
         if self.requires_static_e4m3_attention:
             attention_kwargs.update(
                 {

@@ -37,7 +37,7 @@ from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMod
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder, joint_token_tags
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .timestep_embedding import CombinedTimestepTextProjEmbeddings
@@ -605,6 +605,7 @@ class HunyuanVideo15Attention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # QKV Proj
         query, key, value = self.get_qkv(hidden_states)
@@ -642,11 +643,16 @@ class HunyuanVideo15Attention(Attention):
         batch_size, seq_len, *_ = query.shape
         key_padding_mask = None
         if attention_mask is not None:
-            key_padding_mask = torch.nn.functional.pad(
-                attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
-            ).bool()
+            key_padding_mask = attention_mask
+            if key_padding_mask.shape[1] != seq_len:
+                key_padding_mask = torch.nn.functional.pad(
+                    key_padding_mask, (seq_len - key_padding_mask.shape[1], 0), value=True
+                )
+            key_padding_mask = key_padding_mask.bool()
 
-        hidden_states = self._attn_impl(query, key, value, key_padding_mask=key_padding_mask)
+        hidden_states = self._attn_impl(
+            query, key, value, key_padding_mask=key_padding_mask, token_tags=token_tags
+        )
 
         # hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -715,6 +721,7 @@ class HunyuanVideo15TransformerBlock(torch.nn.Module):
         temb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        token_tags: Optional[torch.Tensor] = None,
         *args,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -732,6 +739,7 @@ class HunyuanVideo15TransformerBlock(torch.nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
+            token_tags=token_tags,
         )
 
         # 3. Modulation and residual connection
@@ -767,6 +775,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
 
         num_attention_heads = getattr(pretrained_config, "num_attention_heads", 16)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_attention_heads)
+        self._token_tags: dict = {}  # per shape: utils.joint_token_tags
 
         dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
@@ -1091,6 +1100,20 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
                 )
 
         else:
+            # The text mask padded to the joint sequence (every image token valid) once, so that
+            # the blocks pass one key padding mask tensor to the attention backends.
+            encoder_attention_mask = torch.nn.functional.pad(
+                encoder_attention_mask, (hidden_states.shape[1], 0), value=True
+            ).bool()
+            # the modality of every token of the joint sequence (image, then text with its
+            # padding last), for the attention backends
+            token_tags = joint_token_tags(
+                self._token_tags,
+                encoder_hidden_states.shape[1],
+                hidden_states.shape[1],
+                hidden_states.device,
+                text_first=False,
+            )
             for block in self.transformer_blocks:
                 hidden_states, encoder_hidden_states = block(
                     hidden_states,
@@ -1098,6 +1121,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
                     temb,
                     encoder_attention_mask,
                     image_rotary_emb,
+                    token_tags=token_tags,
                 )
 
         # 5. Output projection
