@@ -20,6 +20,7 @@ and fails it when the kernel package does not import.
 
 import importlib
 import itertools
+import math
 import multiprocessing
 
 import pytest
@@ -47,6 +48,10 @@ V_DTYPES = ("fp8", "nvfp4")
 # Sequence lengths that no other forward of the process uses, one per request.
 _UNSEEN_LENGTHS = itertools.count(2001)
 MIN_SEQ_LEN = deco_backend.MIN_SEQ_LEN
+# The LSE of the kernels is that of the quantized weights the row was normalized with: on rows whose
+# weights the P codes represent, its distance to the FP32 log-sum-exp is the bias of the NVFP4 score
+# error, measured at 0.07 at most on B300 and RTX PRO 6000.
+LSE_TOLERANCE = 0.15
 
 
 @pytest.fixture
@@ -216,6 +221,7 @@ def test_deco_selection(deco_recipe) -> None:
         "TRTLLM", quant_algorithm="vc_attention"
     ) is get_visual_gen_attention_backend("TRTLLM")
     assert DeCoAttention.support_key_padding_mask()
+    assert DeCoAttention.support_lse()
     assert DeCoAttention.requires_trailing_padding()
     assert not DeCoAttention.support_valid_seq_len()
 
@@ -930,6 +936,102 @@ def test_deco_batch_stride_past_2_to_the_24_tokens(require_deco_kernels) -> None
         )
     assert not torch.equal(out[0, :valid], out[1, :valid])
     assert not out[:, valid:].any()
+
+
+def _lse_reference(q: torch.Tensor, k: torch.Tensor, lens: torch.Tensor | None) -> torch.Tensor:
+    """FP32 log-sum-exp of the scores of every query row, [B, H, S]; with lengths the keys from a
+    sample's length on are left out and its query rows from there on are -inf."""
+    scores = q.float().transpose(1, 2) @ k.float().transpose(1, 2).transpose(-1, -2)
+    scores = scores / q.shape[-1] ** 0.5
+    if lens is not None:
+        valid = torch.arange(q.shape[1], device=q.device)[None] < lens[:, None]
+        scores = scores.masked_fill(~valid[:, None, None, :], -math.inf)
+    lse = torch.logsumexp(scores, dim=-1)
+    if lens is not None:
+        lse = lse.masked_fill(~valid[:, None, :], -math.inf)
+    return lse
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_lse_is_the_log_sum_exp_of_the_scores(
+    require_deco_kernels, deco_recipe, v_dtype: str
+) -> None:
+    """``attention(operands, out, lse)`` fills the natural-log sum of exp of every query row's
+    scores as the row was normalized. On rows whose weights the P codes represent (scores of
+    unit spread) it is within the QK quantization's bias of the FP32 value, -inf past a valid
+    length, on the launch plans of production sizes with and without lengths. On rows that a few
+    keys dominate it is the normalizer of the kernel's own output: the outputs of the two key
+    halves combined with their LSEs give the output over all keys. The backend's
+    ``forward_with_lse`` returns ``forward``'s output with it, on the kernels and on a delegated
+    call."""
+    device = require_deco_kernels(v_dtype)
+    batch, rows, heads, valid = _multi_launch_call(device, v_dtype)
+    cases = [
+        ((2, 1024, 3), None),
+        ((2, 1024, 3), (1024, 700)),
+        ((batch, rows, heads), None),
+        ((batch, rows, heads), (valid,) * batch),
+    ]
+    for (batch_size, seq_len, num_heads), lengths in cases:
+        q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
+        lens = None if lengths is None else torch.tensor(lengths, dtype=torch.int32, device=device)
+        num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
+        workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        operands = deco_attention.prepare(q, k, v, workspace, v_dtype, valid_seq_lens=lens)
+        lse = torch.full((batch_size, num_heads, seq_len), math.nan, device=device)
+        out = deco_attention.attention(operands, torch.empty_like(q), lse)
+        assert torch.equal(out, deco_attention.attention(operands, torch.empty_like(q)))
+        ref = _lse_reference(q, k, lens)
+        finite = torch.isfinite(ref)
+        assert torch.equal(torch.isfinite(lse), finite) and not torch.isnan(lse).any()
+        assert torch.equal(lse[~finite], ref[~finite])
+        assert (lse[finite] - ref[finite]).abs().max().item() < LSE_TOLERANCE
+
+    with pytest.raises(ValueError, match="lse must be"):
+        deco_attention.attention(operands, torch.empty_like(q), lse.to(torch.bfloat16))
+
+    # Rows that a few keys dominate: the two key halves, combined with their LSEs, give the output
+    # over all keys up to the kernel's own error (each half estimates its own basis).
+    batch_size, seq_len, num_heads = 1, 2048, 2
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+    whole = _kernels(q, k, v, v_dtype)
+    halves, lses = [], []
+    for keys in (slice(0, seq_len // 2), slice(seq_len // 2, seq_len)):
+        num_bytes = deco_attention.workspace_size(
+            batch_size, seq_len // 2, num_heads, device, v_dtype
+        )
+        workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        lse = torch.empty((batch_size, num_heads, seq_len // 2), device=device)
+        operands = deco_attention.prepare(
+            q[:, : seq_len // 2], k[:, keys], v[:, keys], workspace, v_dtype
+        )
+        halves.append(
+            deco_attention.attention(operands, torch.empty_like(q[:, : seq_len // 2]), lse)
+        )
+        lses.append(lse)
+    total = torch.logsumexp(torch.stack(lses), dim=0)
+    weights = [torch.exp(part - total).transpose(1, 2)[..., None] for part in lses]
+    combined = sum(w * h.float() for w, h in zip(weights, halves))
+    ref = _sdpa(q[:, : seq_len // 2], k, v)
+    assert (
+        _relative_error(combined, ref) < 1.5 * _relative_error(whole[:, : seq_len // 2], ref) + 0.02
+    )
+
+    attn = _backend(num_heads, deco_recipe(v_dtype))
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
+    out, lse = attn.forward_with_lse(q, k, v)
+    assert torch.equal(out, attn.forward(q, k, v))
+    assert (lse - _lse_reference(q, k, None)).abs().max().item() < LSE_TOLERANCE
+    # A delegated call (FP16 inputs) computes its LSE from the scores; its padded query rows are
+    # -inf.
+    q16, k16, v16 = (x.half() for x in (q, k, v))
+    key_padding_mask = torch.arange(seq_len, device=device)[None] < 700
+    out, lse = attn.forward_with_lse(q16, k16, v16, key_padding_mask=key_padding_mask)
+    assert torch.equal(out, attn.forward(q16, k16, v16, key_padding_mask=key_padding_mask))
+    ref = _lse_reference(q16, k16, torch.tensor([700], dtype=torch.int32, device=device))
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    assert (lse[finite] - ref[finite]).abs().max().item() < 1e-3
 
 
 def test_deco_sm120_fp8_takes_at_least_one_key_tile(require_deco_kernels) -> None:

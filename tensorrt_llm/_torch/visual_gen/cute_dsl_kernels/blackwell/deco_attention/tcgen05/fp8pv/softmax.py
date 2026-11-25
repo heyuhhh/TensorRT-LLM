@@ -358,7 +358,7 @@ class SoftmaxRole:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % self.threads_per_wg
         sVecRow = None
-        if cutlass.const_expr(self.split):
+        if cutlass.const_expr(self.anchor_exchange):
             # this thread's row of the warpgroup's anchor exchange with the epilogue warpgroup
             sVecRow = sVecWG[thread_idx, None, None]
 
@@ -484,8 +484,8 @@ class SoftmaxRole:
             )
             # final stats for the epilogue
             vec_i_handle = si_epi_producer.acquire_and_advance()
-            if cutlass.const_expr(self.split):
-                # final anchor of this KV piece: O and its row-sum column are relative to it
+            if cutlass.const_expr(self.anchor_exchange):
+                # final anchor of this work tile or KV piece: O, its row-sum column and the LSE are relative to it
                 sVecRow[0, vec_i_handle.index] = row_max
             vec_i_handle.commit()
             cute.arch.barrier_arrive(

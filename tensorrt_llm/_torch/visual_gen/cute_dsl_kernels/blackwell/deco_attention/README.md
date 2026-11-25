@@ -35,7 +35,8 @@ workspace = torch.empty(size, dtype=torch.uint8, device="cuda")
 out = torch.empty_like(q)
 
 operands = prepare(q, k, v, workspace)     # contiguous BF16 [B, S, H, 128] in
-attention(operands, out)                   # BF16 [B, S, H, 128] out
+attention(operands, out)                   # BF16 [B, S, H, 128] out; attention(operands, out, lse) also fills
+                                           # lse, FP32 [B, H, S]: the log-sum-exp of every query row
 ```
 
 | Function | Result |

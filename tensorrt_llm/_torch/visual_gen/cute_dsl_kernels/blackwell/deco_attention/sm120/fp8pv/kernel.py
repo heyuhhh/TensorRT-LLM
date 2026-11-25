@@ -61,7 +61,15 @@ from ...common.mem import load_invariant, mbar_wait, sptr
 from ...common.state import State
 from ..ptx.fp8pv import atom_add_shared_u32_lane0, lane_zero, packed_pv_needed, stage_next
 from ..valid_len import valid_len
-from .epilogue import inv_row_sums, store_partials, store_rows, store_zero_rows
+from .epilogue import (
+    inv_row_sums,
+    lse_of,
+    row_sums,
+    store_lse,
+    store_partials,
+    store_rows,
+    store_zero_rows,
+)
 from .layout import (
     BAR_OFF,
     CNT_OFF,
@@ -548,12 +556,17 @@ def run_phases(st, ops, rng, S, H):
 
 @cute.jit
 def run_unit(
-    st, ops, rng, whole, vs_ptr, o_ptr, part_ptr, slot, S, H, with_lens: cutlass.Constexpr
+    st, ops, rng, whole, vs_ptr, o_ptr, lse_ptr, part_ptr, slot, S, H, with_lens: cutlass.Constexpr
 ):
     """Run the phases of the CTA over its range rng, then store the final BF16 rows of a whole unit (those from the
-    length on as zeros) or the FP32 partials of piece `slot` for the merge."""
+    length on as zeros) and their LSE (lse_ptr, epilogue.store_lse), or the FP32 partials of piece `slot` for the
+    merge."""
     anc0, anc1, l0, l1, _ = run_phases(st, ops, rng, S, H)
     if whole:
+        nv = valid_keys(st) if with_lens else None
+        s0, s1 = row_sums(l0, l1)
+        lse0, lse1 = lse_of(anc0, s0), lse_of(anc1, s1)
+        store_lse(lse_ptr, lse0, lse1, st.g, st.q, st.warp, st.qt, st.bb, st.hh, S, H, nv)
         # row sums over the quad; o = O * v8_scale / l, staged through stages 0 and 1 as bf16 rows
         f = inv_row_sums(l0, l1, st.q)
         # the warp pairs run independently: every warp must be past its last stage read before the stages are reused
@@ -573,14 +586,14 @@ def run_unit(
             st.hh,
             S,
             H,
-            valid_keys(st) if with_lens else None,
+            nv,
         )
     else:
         store_partials(part_ptr, slot, st.tidx, st.O, anc0, anc1, l0, l1)
 
 
 @cute.jit
-def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid):
+def unit_body(ops, lens_ptr, vs_ptr, o_ptr, lse_ptr, part_ptr, S, H, split, n_full, bid):
     """Run the CTA body: a whole unit (bid < n_full) or a key-range piece of a unit of the split tail.
 
     * A whole unit runs all key tiles in its order (diagonal first) and stores its rows; piece p of `split` runs the
@@ -611,11 +624,11 @@ def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid):
     rng = (lambda: r0, lambda: r1, lambda: r2, lambda: r3)
     slot = bid - n_full
     if cutlass.const_expr(not with_lens):
-        run_unit(st, ops, rng, whole, vs_ptr, o_ptr, part_ptr, slot, S, H, False)
+        run_unit(st, ops, rng, whole, vs_ptr, o_ptr, lse_ptr, part_ptr, slot, S, H, False)
     else:
         if st.qt * QT < nv:
             if r0 < kv:
-                run_unit(st, ops, rng, whole, vs_ptr, o_ptr, part_ptr, slot, S, H, True)
+                run_unit(st, ops, rng, whole, vs_ptr, o_ptr, lse_ptr, part_ptr, slot, S, H, True)
             else:
                 zero = cute.make_rmem_tensor(cute.make_layout(64), Float32)
                 zero.fill(0.0)
@@ -626,6 +639,8 @@ def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid):
         else:
             if whole:
                 store_zero_rows(st.lane, st.warp, st.qt, o_ptr.toint(), st.bb, st.hh, S, H)
+                ninf = -Float32.inf
+                store_lse(lse_ptr, ninf, ninf, st.g, st.q, st.warp, st.qt, st.bb, st.hh, S, H)
 
 
 # ------------------------------------------------------------------------------------------------ kernel
@@ -636,6 +651,7 @@ def attn_kernel(
     ss_ptr: cute.Pointer,
     vs_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
+    lse_ptr: Int64,
     part_ptr: cute.Pointer,
     flags_ptr: cute.Pointer,
     tma_atom_k: cute.CopyAtom,
@@ -657,6 +673,7 @@ def attn_kernel(
     * S, H: the sequence length and the heads of the call; the pieces: split per unit, of the units from n_full on
       (launch.split_plan); part_ptr: their partials.
     * ss_ptr, vs_ptr: the score scale and v8_scale; flags_ptr: the per-tile flags of the V pass.
+    * lse_ptr: the address of the FP32 [B, H, S] log-sum-exp output, or 0 for none (epilogue.store_lse).
     * lens_ptr: None, or the valid prefix lengths, which the body then reads.
     """
     bid_, _, _ = cute.arch.block_idx()
@@ -664,4 +681,4 @@ def attn_kernel(
     # the K' scales and v_mean
     tiles = (tma_atom_k, tma_k, tma_atom_v, tma_v, tma_atom_s, tma_s, tma_atom_m, tma_m)
     ops = (q_ptr, qsf_ptr, ss_ptr, flags_ptr, tiles)
-    unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, Int32(bid_))
+    unit_body(ops, lens_ptr, vs_ptr, o_ptr, lse_ptr, part_ptr, S, H, split, n_full, Int32(bid_))

@@ -51,6 +51,7 @@ from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 from ...common.expmath import bf16x2, f2u, subnormal_scale, u2f
 from ...common.mem import gptr, load_invariant, load_vector, mbar_wait, sptr, store_vector
 from ...common.state import State
+from ...constants import E2M1_MAX, E4M3_MAX, LN2, RESCALE_THRESHOLD
 from ..ptx.nvfp4pv import (
     atom_add_shared_u32_elect,
     barrier_turn,
@@ -403,6 +404,7 @@ def attn_kernel(
     vs_ptr: cute.Pointer,
     img_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
+    lse_ptr: Int64,
     ws_ptr: cute.Pointer,
     S: Int32,
     H: Int32,
@@ -413,9 +415,10 @@ def attn_kernel(
 ):
     """One work unit per CTA, NTHREADS threads: thread (warp, g, t) holds the query rows 16 warp + g and + 8 of the
     unit's tile, as the warp-level MMAs lay out their fragments. NFULL, RSPLIT, KMID: split_plan of the grid; ws_ptr:
-    the split units' partials and arrival counters. lens_ptr: None, or the valid prefix lengths: the keys of the
-    unit's batch element then end at its length (the tiles after the one that holds it are not run), and the query
-    rows from there on are zero in o."""
+    the split units' partials and arrival counters. lse_ptr: the address of the FP32 [B, H, S] log-sum-exp output,
+    or 0 for none (store_lse). lens_ptr: None, or the valid prefix lengths: the keys of the unit's batch element then
+    end at its length (the tiles after the one that holds it are not run), and the query rows from there on are zero
+    in o and -inf in the LSE."""
     nT = key_tiles(S)
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -554,6 +557,7 @@ def attn_kernel(
         row_g8=row_g8,
         vscale=vscale,
         o_base=o_ptr.toint(),
+        lse_base=lse_ptr,
         ws=ws_ptr.toint(),
         cnt_g=ws_ptr.toint() + Int64(RSPLIT) * RECORD_BYTES,
         tidx=tidx,
@@ -588,13 +592,14 @@ def attn_kernel(
         else:
             epilogue_partial(st, unit - NFULL, part)
     elif (part != 2) & (qt * 128 >= cta_word(st, CNT_VALID)):
-        # a unit without a valid query row: zeros, by its only CTA or by the first of its two
+        # a unit without a valid query row: zeros, by its only CTA or by the first of its two, -inf as the LSE
         for rr in cutlass.range_constexpr(2):
             row = row_g + 8 * rr
             if row < S:
                 ob = o_ptr.toint() + Int64((bb * S + row) * H + hh) * 256 + 4 * t
                 for jc in cutlass.range_constexpr(16):
                     cute.arch.store(gptr(Uint32, ob + 16 * jc), Uint32(0))
+        store_lse(st, lambda rr: -Float32.inf)
 
 
 # ------------------------------------------------------------------------------------------------ epilogues
@@ -619,10 +624,43 @@ def store_o(st, word):
 
 
 @cute.jit
+def store_lse(st, value):
+    """Store value(rr) as the LSE of the thread's two rows (one lane per row) when the launch has an LSE output
+    (st.lse_base: the address of the FP32 [B, H, S], or 0); a row from the valid keys on gets -inf."""
+    if st.lse_base != Int64(0):
+        if st.t == 0:
+            rows = [st.row_g, st.row_g8]
+            nv = cta_word(st, CNT_VALID)
+            for rr in cutlass.range_constexpr(2):
+                if rows[rr] < st.S:
+                    lse = Float32(cutlass.select_(rows[rr] < nv, value(rr), -Float32.inf))
+                    cute.arch.store(
+                        gptr(
+                            Float32,
+                            st.lse_base + Int64((st.bb * st.H + st.hh) * st.S + rows[rr]) * 4,
+                        ),
+                        lse,
+                    )
+
+
+# the row sum adds P as the E2M1 element values (6 at the block max) times the decoded UE4M3 block scales (448 at the
+# anchor less T binades): a weight at the anchor counts 6 * 448 * 2^-T, which the LSE takes out again
+_LSE_OFFSET = math.log2(E2M1_MAX * E4M3_MAX) - RESCALE_THRESHOLD
+
+
+def lse_of(anchor, l):
+    """The log-sum-exp (natural units) of a row from its anchor (log2 units) and row sum l (softmax.py, sums):
+    ln 2 (anchor + log2 l - _LSE_OFFSET)."""
+    return Float32(LN2) * (anchor + cute.math.log2(l) - Float32(_LSE_OFFSET))
+
+
+@cute.jit
 def epilogue_final(st):
-    """o = O * v4_scale / l, l the row sum over the four lanes of the row."""
+    """o = O * v4_scale / l, l the row sum over the four lanes of the row; the LSE of the rows (store_lse)."""
     O = st.O
-    inv = [st.vscale * cute.arch.rcp_approx(row_sum(st, rr)) for rr in range(2)]
+    ls = [row_sum(st, rr) for rr in range(2)]
+    store_lse(st, lambda rr: lse_of(st.anchor[rr], ls[rr]))
+    inv = [st.vscale * cute.arch.rcp_approx(ls[rr]) for rr in range(2)]
     store_o(
         st, lambda rr, jc: bf16x2(O[4 * jc + 2 * rr] * inv[rr], O[4 * jc + 2 * rr + 1] * inv[rr])
     )
@@ -677,6 +715,7 @@ def epilogue_partial(st, slot, part):
         f1 = []
         f2 = []
         inv = []
+        lses = []
         for rr in cutlass.range_constexpr(2):
             ao = u2f(w[16][2 + rr])
             lo = u2f(w[16][rr])
@@ -687,13 +726,13 @@ def epilogue_partial(st, slot, part):
             e2 = cute.arch.exp2(a2 - am)
             f1.append(e1)
             f2.append(e2)
-            inv.append(
-                st.vscale
-                * cute.arch.rcp_approx(
-                    Float32(cutlass.select_(is_part1 != 0, ls[rr], lo)) * e1
-                    + Float32(cutlass.select_(is_part1 != 0, lo, ls[rr])) * e2
-                )
+            l_all = (
+                Float32(cutlass.select_(is_part1 != 0, ls[rr], lo)) * e1
+                + Float32(cutlass.select_(is_part1 != 0, lo, ls[rr])) * e2
             )
+            inv.append(st.vscale * cute.arch.rcp_approx(l_all))
+            lses.append(lse_of(am, l_all))
+        store_lse(st, lambda rr: lses[rr])
         store_o(st, lambda rr, jc: _merged_word(O, w, is_part1, f1, f2, inv, rr, jc))
         if st.tidx == 0:
             cute.arch.store(gptr(Int32, st.cnt_g + 4 * slot), Int32(0))

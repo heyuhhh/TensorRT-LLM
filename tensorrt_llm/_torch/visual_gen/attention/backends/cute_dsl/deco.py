@@ -41,12 +41,16 @@ like any other backend.
 * Device only: the token counts and the sampled tokens of a call are computed on the device and
   nothing is read back to the host. The layers of a forward share one draw: the kernel package
   keeps the last one while the model passes the same mask and tags tensors.
+* LSE: ``forward_with_lse`` returns the output with the log-sum-exp of the scores of every query
+  row, FP32 ``[B, H, S]`` in natural units, as the row's output was normalized; a padded query
+  row gets -inf. Ring and Attention2D parallelism combine partial outputs with it.
 * CUDA graphs: first use (a kernel variant, the inputs of a sequence length) runs eagerly, as
   in the warm-up of a graph runner, and raises ``RuntimeError`` under capture. A captured call
   computes its token counts and sampled tokens inside the graph: a replay follows the content
   of the captured mask and tags tensors.
 """
 
+import math
 from typing import Any
 
 import torch
@@ -167,12 +171,20 @@ class DeCoAttention(AttentionBackend):
         return None
 
     def _delegate(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, one_sequence: bool, **kwargs: Any
-    ) -> torch.Tensor:
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        one_sequence: bool,
+        with_lse: bool,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run a call on VANILLA. For one sequence, ``key_padding_mask`` is read as a prefix, as
         the kernels read it, and the rows it excludes come back zero, as from the kernels; what
         they hold has no influence: a padded V row enters SDPA with weight zero, which spreads a
-        NaN in it over the valid rows, so the padded K and V rows are zeroed first."""
+        NaN in it over the valid rows, so the padded K and V rows are zeroed first. With
+        ``with_lse`` the LSE of a self-attention call under the FULL mask comes from the scores in
+        FP32 (``_delegated_lse``)."""
         key_padding_mask = kwargs.get("key_padding_mask")
         padded = None
         if key_padding_mask is not None and one_sequence:
@@ -189,7 +201,32 @@ class DeCoAttention(AttentionBackend):
         ).transpose(1, 2)
         if padded is not None:
             out = out.masked_fill(padded, 0)
-        return out
+        if not with_lse:
+            return out
+        if not one_sequence or kwargs.get("attention_mask", PredefinedAttentionMask.FULL) != (
+            PredefinedAttentionMask.FULL
+        ):
+            raise NotImplementedError("forward_with_lse takes self-attention under the FULL mask.")
+        return out, self._delegated_lse(q, k, key_padding_mask)
+
+    def _delegated_lse(
+        self, q: torch.Tensor, k: torch.Tensor, key_padding_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The LSE of a delegated call, FP32 ``[B, H, S]``, from the scores in FP32 in chunks of
+        query rows; the keys that the mask excludes are left out, and a query row that it excludes
+        gets -inf, as its output is zero."""
+        batch_size, seq_len, num_heads, _ = q.shape
+        qh, kh = q.float().transpose(1, 2), k.float().transpose(1, 2)
+        lse = torch.empty((batch_size, num_heads, seq_len), dtype=torch.float32, device=q.device)
+        chunk = max(1, 2**26 // (num_heads * seq_len))  # about 256 MB of scores per chunk
+        for start in range(0, seq_len, chunk):
+            scores = qh[:, :, start : start + chunk] @ kh.transpose(-1, -2) * self._vanilla.scale
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(~key_padding_mask[:, None, None, :], -math.inf)
+            lse[:, :, start : start + chunk] = torch.logsumexp(scores, dim=-1)
+        if key_padding_mask is not None:
+            lse = lse.masked_fill(~key_padding_mask[:, None, :], -math.inf)
+        return lse
 
     @staticmethod
     def _kernel_input(x: torch.Tensor) -> bool:
@@ -207,9 +244,11 @@ class DeCoAttention(AttentionBackend):
         v: torch.Tensor,
         key_padding_mask: torch.Tensor | None,
         token_tags: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run the preparation and the attention kernel. Everything that reads a tensor address
-        or launches a kernel is here, outside compiled code.
+        with_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run the preparation and the attention kernel; with ``with_lse`` return the output with
+        the LSE of its rows. Everything that reads a tensor address or launches a kernel is here,
+        outside compiled code.
 
         What the padding and the tags give the kernels is computed on the device:
 
@@ -257,7 +296,13 @@ class DeCoAttention(AttentionBackend):
                 rows=rows,
                 valid_seq_lens=token_counts,
             )
-            return deco_attention.attention(operands, torch.empty_like(q))
+            lse = (
+                torch.empty((batch_size, num_heads, seq_len), dtype=torch.float32, device=q.device)
+                if with_lse
+                else None
+            )
+            out = deco_attention.attention(operands, torch.empty_like(q), lse)
+            return (out, lse) if with_lse else out
 
     @torch.compiler.disable
     def _note_unquantized(self, reason: str) -> None:
@@ -283,6 +328,23 @@ class DeCoAttention(AttentionBackend):
         The module docstring says how the backend reads the keywords ``key_padding_mask`` and
         ``token_tags``.
         """
+        return self._run(q, k, v, False, **kwargs)
+
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The output of ``forward`` with the log-sum-exp of the scores of every query row, FP32
+        ``[B, H, S]`` in natural units (the module docstring); a delegated call computes it from
+        the scores in FP32 for self-attention under the FULL mask, and has none otherwise."""
+        return self._run(q, k, v, True, **kwargs)
+
+    def _run(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, with_lse: bool, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         key_padding_mask = kwargs.get("key_padding_mask")
         if key_padding_mask is not None and key_padding_mask.dtype != torch.bool:
             key_padding_mask = kwargs["key_padding_mask"] = key_padding_mask.bool()
@@ -292,13 +354,13 @@ class DeCoAttention(AttentionBackend):
         if not (self._has_kernel_geometry and one_sequence):
             if self._has_kernel_geometry and not self._noted_unquantized:
                 self._note_unquantized("cross-attention (q and k of different shapes)")
-            return self._delegate(q, k, v, one_sequence, **kwargs)
+            return self._delegate(q, k, v, one_sequence, with_lse, **kwargs)
         reason = self._delegation_reason(q, k, v, **kwargs)
         if reason is not None:
             if not self._noted_unquantized:
                 self._note_unquantized(reason)
-            return self._delegate(q, k, v, one_sequence, **kwargs)
-        return self._launch(q, k, v, key_padding_mask, kwargs.get("token_tags"))
+            return self._delegate(q, k, v, one_sequence, with_lse, **kwargs)
+        return self._launch(q, k, v, key_padding_mask, kwargs.get("token_tags"), with_lse)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
@@ -310,6 +372,10 @@ class DeCoAttention(AttentionBackend):
 
     @classmethod
     def support_key_padding_mask(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_lse(cls) -> bool:
         return True
 
     @classmethod

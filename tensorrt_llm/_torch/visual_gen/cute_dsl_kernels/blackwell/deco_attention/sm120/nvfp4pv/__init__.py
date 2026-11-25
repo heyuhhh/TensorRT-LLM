@@ -68,7 +68,10 @@ def prepare(
 
 
 def attention(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
     """Run the attention: BF16 o from the buffers of a call that prepare has filled; lens: those of prepare, or None."""
-    launch.run(buffers, o, lens)
+    launch.run(buffers, o, lens, lse)

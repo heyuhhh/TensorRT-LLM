@@ -259,12 +259,30 @@ def prepare(
     return Operands(pv, rank, shape[:3], buffers, lens)
 
 
-def attention(operands: Operands, out: torch.Tensor) -> torch.Tensor:
+def attention(
+    operands: Operands, out: torch.Tensor, lse: torch.Tensor | None = None
+) -> torch.Tensor:
     """Run the attention on operands of prepare: fill and return out, contiguous BF16 [B, S, H, 128] on their device at
-    a 256-byte aligned address."""
+    a 256-byte aligned address.
+
+    lse: None, or a contiguous FP32 tensor [B, H, S] on that device that receives the log-sum-exp of the scores of
+    every query row in natural units, as the row's output was normalized (of the quantized P, with the kernels' error
+    of the row sum); a query row past its valid length gets -inf. What a sequence-parallel combine of partial outputs
+    takes (the lse of FA4 and of the dense CUTEDSL kernel)."""
     if not isinstance(operands, Operands):
         raise ValueError("operands is not a result of prepare")
     device = next(iter(operands.buffers.values())).device
     _check((*operands.shape, HEAD_DIM), device, out=out)
-    _family().attention(operands.buffers, out, operands.pv, operands.rank, operands.valid_seq_lens)
+    B, S, H = operands.shape
+    if lse is not None and (
+        not torch.is_tensor(lse)
+        or lse.dtype != torch.float32
+        or tuple(lse.shape) != (B, H, S)
+        or lse.device != device
+        or not lse.is_contiguous()
+    ):
+        raise ValueError(f"lse must be a contiguous float32 tensor [{B}, {H}, {S}] on {device}")
+    _family().attention(
+        operands.buffers, out, operands.pv, operands.rank, operands.valid_seq_lens, lse
+    )
     return out

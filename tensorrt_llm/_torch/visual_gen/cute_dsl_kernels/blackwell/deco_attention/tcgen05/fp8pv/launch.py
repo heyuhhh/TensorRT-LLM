@@ -81,12 +81,13 @@ def _get_compiled(
     split: bool,
     pdl: bool,
     lens: bool,
+    lse: bool,
 ) -> Callable:
     return compiled(
         _compiled,
-        (device.index, sm_count, rank, cluster_m, split, pdl, lens),
+        (device.index, sm_count, rank, cluster_m, split, pdl, lens, lse),
         lambda: PingPongAttention(
-            sm_count, rank, cluster_m=cluster_m, split=split, pdl=pdl, lens=lens
+            sm_count, rank, cluster_m=cluster_m, split=split, pdl=pdl, lens=lens, lse=lse
         ),
         *args,
     )
@@ -103,6 +104,7 @@ def _make_args(
     score_scale: torch.Tensor,
     v_scale: torch.Tensor,
     lens: torch.Tensor | None,
+    lse: torch.Tensor | None,
     stream: cuda.CUstream,
     n_full: int,
     n_parts: int = 1,
@@ -118,6 +120,8 @@ def _make_args(
         Int32(b),
         Int64(score_scale.data_ptr()),
         Int64(v_scale.data_ptr()),
+        # the LSE output of the lse kernel variant (a null address otherwise)
+        Int64(lse.data_ptr() if lse is not None else 0),
         Int32(n_full),
         Int32(n_parts),
         # the split launch's merge scratch (null addresses without one)
@@ -130,7 +134,11 @@ def _make_args(
 
 @torch.no_grad()
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    rank: int,
+    lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
     """Run the NVFP4 Q'K' + FP8 PV attention on the operands of the preparation into BF16 o [B, S, H, 128].
 
@@ -139,6 +147,7 @@ def run(
     * Every launch goes to the current stream; nothing here reads a device value or allocates (graph-capturable).
     * lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variant with
       lengths; the launch plan follows the padded sequence either way.
+    * lse: None, or FP32 [B, H, S] for the log-sum-exp of every query row (api.attention).
     """
     q4, k4, q_sf, k_sf, v8, v_mean, score_scale, v8_scale = (
         buffers[n] for n in ("q4", "k4", "q_sf", "k_sf", "v8", "v_mean", "score_scale", "v8_scale")
@@ -167,6 +176,7 @@ def run(
             score_scale,
             v8_scale,
             lens,
+            lse,
             stream,
             n_full,
             n_parts,
@@ -184,12 +194,28 @@ def run(
             else 1
         )
         _get_compiled(
-            args, dev, sm_count, rank, cluster_m, split=False, pdl=pdl, lens=lens is not None
+            args,
+            dev,
+            sm_count,
+            rank,
+            cluster_m,
+            split=False,
+            pdl=pdl,
+            lens=lens is not None,
+            lse=lse is not None,
         )(*args)
     if "split_flags" in buffers:
         # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
         ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
         args = make_args(n_parts, ws)
         _get_compiled(
-            args, dev, sm_count, rank, 1, split=True, pdl=pdl and n_full > 0, lens=lens is not None
+            args,
+            dev,
+            sm_count,
+            rank,
+            1,
+            split=True,
+            pdl=pdl and n_full > 0,
+            lens=lens is not None,
+            lse=lse is not None,
         )(*args)

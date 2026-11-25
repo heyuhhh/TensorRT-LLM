@@ -109,6 +109,8 @@ def attention(
     pv: str,
     rank: int,
     valid_seq_lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
-    """Write BF16 o [B, S, H, 128] from the buffers of prepare, with the lengths prepare took, on the current stream."""
-    _KERNELS[pv].attention(buffers, o, valid_seq_lens)
+    """Write BF16 o [B, S, H, 128] from the buffers of prepare, with the lengths prepare took, on the current stream;
+    lse: None, or the FP32 [B, H, S] log-sum-exp output."""
+    _KERNELS[pv].attention(buffers, o, valid_seq_lens, lse)

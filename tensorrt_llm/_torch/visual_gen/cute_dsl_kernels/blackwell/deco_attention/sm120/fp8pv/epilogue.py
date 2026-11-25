@@ -30,18 +30,49 @@ from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from ...common.expmath import RN
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
+from ...constants import LN2, RESCALE_THRESHOLD
 from ..valid_len import valid_len
 from .layout import EP, KT, NTHR, QT
 
 PART_N = 68  # FP32 words per thread of a piece's partials: 64 of O, 2 anchors, 2 row sums
 
 
-def inv_row_sums(l0, l1, q):
-    """Return 1 / l of the O^T columns of the lane from the partial row sums l0, l1 of the quad (module docstring)."""
+def row_sums(l0, l1):
+    """Return the row sums of rows g and g + 8 of the lane's warp from the partial sums of the quad."""
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=1)
     l1 = l1 + cute.arch.shuffle_sync_bfly(l1, offset=1)
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=2)
     l1 = l1 + cute.arch.shuffle_sync_bfly(l1, offset=2)
+    return l0, l1
+
+
+def lse_of(anchor, l):
+    """Return the log-sum-exp (natural units) of a row from its anchor (log2 units) and row sum l: the landing puts
+    the anchor's weight on 2^RESCALE_THRESHOLD, so it is ln 2 (anchor + log2 l - RESCALE_THRESHOLD)."""
+    return Float32(LN2) * (anchor + cute.math.log2(l) - Float32(RESCALE_THRESHOLD))
+
+
+@cute.jit
+def store_lse(lse_ptr, v0, v1, g, q, warp, qt, bb, hh, S, H, nv=None):
+    """Store v0 and v1 as the LSE of the warp's rows g and g + 8 (one lane per row) when the launch has an LSE output
+    (lse_ptr: the address of the FP32 [B, H, S], or 0). A row from nv on (with lengths) gets -inf: it has no valid
+    key."""
+    if lse_ptr != Int64(0):
+        if q == 0:
+            for rr in cutlass.range_constexpr(2):
+                row = qt * QT + warp * 16 + g + 8 * rr
+                if row < S:
+                    lse = v0 if rr == 0 else v1
+                    if cutlass.const_expr(nv is not None):
+                        lse = Float32(cutlass.select_(row < nv, lse, -Float32.inf))
+                    cute.arch.store(
+                        gptr(Float32, lse_ptr + Int64((bb * H + hh) * S + row) * 4), lse
+                    )
+
+
+def inv_row_sums(l0, l1, q):
+    """Return 1 / l of the O^T columns of the lane from the partial row sums l0, l1 of the quad (module docstring)."""
+    l0, l1 = row_sums(l0, l1)
     r0 = Float32(1.0) / l0
     r1 = Float32(1.0) / l1
     return (
@@ -122,8 +153,11 @@ def store_partials(part_ptr, bid, tidx, O, anc0, anc1, l0, l1):
 
 
 @cute.jit
-def _merge_rows(part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, nv):
-    """Merge the `split` pieces of one unit (merge_partial_kernel) and store its rows, those from nv on as zeros."""
+def _merge_rows(
+    part_ptr, vs_ptr, ob, lse_ptr, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, nv
+):
+    """Merge the `split` pieces of one unit (merge_partial_kernel) and store its rows, those from nv on as zeros, and
+    their LSE (lse_ptr, store_lse)."""
     pb0 = part_ptr.toint() + Int64(bid * split * PART_N) * (NTHR * 4) + tidx * 4
     m0 = load_invariant(Float32, pb0 + 64 * (NTHR * 4))
     m1 = load_invariant(Float32, pb0 + 65 * (NTHR * 4))
@@ -156,6 +190,8 @@ def _merge_rows(part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, s
                 load_invariant(Float32, pb + i * (NTHR * 4)), factor, O[i], rounding=RN
             )
     f = inv_row_sums(l0, l1, q)
+    l0, l1 = row_sums(l0, l1)
+    store_lse(lse_ptr, lse_of(m0, l0), lse_of(m1, l1), g, q, warp, qt, bb, hh, S, H, nv)
     vsc = load_invariant(Float32, vs_ptr.toint())
     smem = Int32(cute.arch.get_dyn_smem(cutlass.Uint8, alignment=16).toint())
     store_rows(O, f, vsc, smem + warp * (16 * EP), g, q, lane, warp, qt, ob, bb, hh, S, H, nv)
@@ -166,6 +202,7 @@ def merge_partial_kernel(
     part_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
     vs_ptr: cute.Pointer,
+    lse_ptr: Int64,
     S: Int32,
     H: Int32,
     split: Int32,
@@ -191,16 +228,14 @@ def merge_partial_kernel(
     g = lane >> 2
     q = lane & 3
     ob = o_ptr.toint()
+    args = (part_ptr, vs_ptr, ob, lse_ptr, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H)
     if cutlass.const_expr(lens_ptr is None):
-        _merge_rows(
-            part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, None
-        )
+        _merge_rows(*args, None)
     else:
         nv = valid_len(lens_ptr.toint(), bb, S)
         if qt * QT >= nv:
-            # the unit has no valid query row: its pieces wrote no partials, its rows are zeros
+            # the unit has no valid query row: its pieces wrote no partials, its rows are zeros, its LSE -inf
             store_zero_rows(lane, warp, qt, ob, bb, hh, S, H)
+            store_lse(lse_ptr, -Float32.inf, -Float32.inf, g, q, warp, qt, bb, hh, S, H)
         else:
-            _merge_rows(
-                part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, nv
-            )
+            _merge_rows(*args, nv)

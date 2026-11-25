@@ -24,7 +24,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.typing import Int32
+from cutlass.cute.typing import Int32, Int64
 
 from ...runtime import compiled, current_stream, gmem_ptr, num_sms
 from .kernel import NTHREADS, RECORD_BYTES, SMEM_BYTES, attn_kernel
@@ -40,6 +40,7 @@ def attn_launch(
     o_ptr: cute.Pointer,
     img_ptr: cute.Pointer,
     ws_ptr: cute.Pointer,
+    lse_ptr: Int64,
     lens_ptr,
     S: Int32,
     H: Int32,
@@ -48,7 +49,8 @@ def attn_launch(
     kmid: Int32,
     stream: cuda.CUstream,
 ):
-    # lens_ptr: None, or the valid prefix lengths, which the kernel reads in place; nfull, rsplit, kmid: split_plan
+    # lens_ptr: None, or the valid prefix lengths, which the kernel reads in place; nfull, rsplit, kmid: split_plan;
+    # lse_ptr: the address of the FP32 [B, H, S] log-sum-exp output, or 0
     attn_kernel(
         q_ptr,
         qsf_ptr,
@@ -56,6 +58,7 @@ def attn_launch(
         vs_ptr,
         img_ptr,
         o_ptr,
+        lse_ptr,
         ws_ptr,
         S,
         H,
@@ -99,11 +102,15 @@ _compiled = {}
 
 
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
     """Run the attention on the current stream: BF16 o [B, S, H, 128] from the operands in the buffers of the call.
     Nothing here reads a device value or allocates. lens: None, or the int32 valid prefix lengths [B], read in place
-    by the kernel variant with lengths; the plan follows the padded S."""
+    by the kernel variant with lengths; the plan follows the padded S. lse: None, or FP32 [B, H, S] for the
+    log-sum-exp of every query row."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -121,6 +128,7 @@ def run(
         )
     ]
     lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
+    lse_addr = Int64(lse.data_ptr() if lse is not None else 0)
     plan = split_plan(B, S, H, num_sms(dev))
-    args = (*ptrs, lens_ptr, *(Int32(x) for x in (S, H, *plan)), stream)
+    args = (*ptrs, lse_addr, lens_ptr, *(Int32(x) for x in (S, H, *plan)), stream)
     compiled(_compiled, (dev.index, lens is not None), lambda: attn_launch, *args)(*args)

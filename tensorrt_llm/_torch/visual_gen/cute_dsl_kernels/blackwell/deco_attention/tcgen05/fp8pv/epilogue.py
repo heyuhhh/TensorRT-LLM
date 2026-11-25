@@ -17,7 +17,8 @@
 O_j times v_scale over the row sum of P (column 128 of O_j), as BF16 into a shared-memory staging tile that the store
 warp stores by TMA. Main launch (epilogue_tile): one O tile at a time. Split launch (epilogue_split): the units of
 the last partial wave are split along KV into pieces that run on different SMs, each with its own anchor, and the
-pieces of an O tile are merged through global memory.
+pieces of an O tile are merged through global memory. With an LSE output, every row's log-sum-exp of the scores
+(natural units, of the quantized P the row was normalized with) is stored beside its O rows (_store_lse).
 """
 
 import cutlass
@@ -28,9 +29,10 @@ from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 
 from ...common.mem import gptr, load_vector, sptr, store_vector
 from ...common.state import State
-from ...constants import HEAD_DIM
+from ...constants import HEAD_DIM, LN2
 from ..valid_len import valid_len
 from .sched import PART
+from .softmax import P_PRESCALE_LOG2
 
 
 class EpilogueRole:
@@ -105,6 +107,7 @@ class EpilogueRole:
         split_info,
         split_args,
         score_scale,
+        lse_args,
         live_rows=None,
     ):
         """Split launch epilogue for both O tiles of a KV piece: all publishes, then the merges.
@@ -197,6 +200,8 @@ class EpilogueRole:
                         gptr(Float32, split_ml_addr + rb * 8 + 4), Float32, cop="cg"
                     )
                     l_fin = l_fin + l_p * cute.math.exp2(score_scale * (m_p - m_fin), fastmath=True)
+                if cutlass.const_expr(lse_args is not None):
+                    self._store_lse(lse_args, stage, thread_idx, m_fin, l_fin, live_rows)
                 scale = scale_output / l_fin
                 for i in cutlass.range_constexpr(ep.n_chunks):
                     tTMrO, dst, coords = self._load_chunk(ep, i)
@@ -274,10 +279,18 @@ class EpilogueRole:
 
     @cute.jit
     def epilogue_tile(
-        self, thr_mma, tensor_args, pipeline_args, scale_output, stage: int, live_rows=None
+        self,
+        thr_mma,
+        tensor_args,
+        pipeline_args,
+        scale_output,
+        stage: int,
+        lse_args,
+        live_rows=None,
     ):
-        """Main launch epilogue of O tile `stage`: O times v_scale over the row sum, as BF16 into its staging tile."""
-        tOtO, dest_O = tensor_args
+        """Main launch epilogue of O tile `stage`: O times v_scale over the row sum, as BF16 into its staging tile;
+        the LSE of the rows with lse_args (_store_lse)."""
+        tOtO, dest_O, vec = tensor_args
         si_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         ep = self._epi_copy(thr_mma, tOtO, dest_O)
 
@@ -285,11 +298,16 @@ class EpilogueRole:
             barrier_id=self.stats_bar_id + stage, number_of_threads=self.stats_bar_threads
         )
         vec_i_handle = si_epi_consumer.wait_and_advance()
+        row_max = Float32(0.0)
+        if cutlass.const_expr(lse_args is not None):
+            row_max = vec[0, vec_i_handle.index]
         vec_i_handle.release()
 
         oi_handle = mma_epi_consumer.wait_and_advance()
         row_sum = self.load_row_sum(thr_mma, tOtO)
         oi_final_handle = epi_store_producer.acquire_and_advance()
+        if cutlass.const_expr(lse_args is not None):
+            self._store_lse(lse_args, stage, ep.thread_idx, row_max, row_sum, live_rows)
         scale = scale_output / row_sum
         for i in cutlass.range_constexpr(ep.n_chunks):
             tTMrO, dst, _ = self._load_chunk(ep, i)
@@ -305,6 +323,26 @@ class EpilogueRole:
             barrier_id=self.epi_bar_id + stage, number_of_threads=self.epi_bar_threads
         )
         return si_epi_consumer, mma_epi_consumer, epi_store_producer
+
+    @cute.jit
+    def _store_lse(self, lse_args, stage: int, thread_idx, row_max, row_sum, live_rows):
+        """Store the LSE of the thread's row of O tile `stage` (a launch with an LSE output).
+
+        lse_args: (the address of the FP32 LSE [B, H, S]; the score scale; the first query row of the work tile;
+        (batch * H + head) * S; S). The anchor row_max is a raw score, the landing puts the anchor's weight on
+        2^P_PRESCALE_LOG2 and row_sum adds the landed weights, so in natural units the row's log-sum-exp is
+        ln 2 (score_scale row_max + log2 row_sum - P_PRESCALE_LOG2). A row from live_rows on (with lengths) gets
+        -inf: it has no valid key."""
+        lse_addr, score_scale, row0, row_block, seqlen = lse_args
+        tile_row = stage * self.pv_mma_tiler[0] + thread_idx
+        row = row0 + tile_row
+        if row < seqlen:
+            lse = Float32(LN2) * (
+                score_scale * row_max + cute.math.log2(row_sum) - Float32(P_PRESCALE_LOG2)
+            )
+            if cutlass.const_expr(live_rows is not None):
+                lse = Float32(cutlass.select_(tile_row < live_rows, lse, -Float32.inf))
+            cute.arch.store(gptr(Float32, lse_addr + Int64(row_block + row) * 4), lse)
 
     @cute.jit
     def store_warp(self, mO_qdl, tma_atom_o, sO, epi_store_consumer, sched_args, last_addr=None):
@@ -344,8 +382,9 @@ class EpilogueRole:
         cute.arch.cp_async_bulk_wait_group(0, read=False)
 
     @cute.jit
-    def zero_rows(self, tile_sched_params, lens_addr, o_addr, seqlen, tidx):
-        """The idle warp of a launch with valid prefix lengths: zeros in the O rows of the units that no role runs.
+    def zero_rows(self, tile_sched_params, lens_addr, o_addr, lse_addr, seqlen, tidx):
+        """The idle warp of a launch with valid prefix lengths: zeros in the O rows of the units that no role runs,
+        and -inf as their LSE in a launch with an LSE output (lse_addr).
 
         * Those units have no query row below the length of their batch element (with CTA pairs: their pair has none).
         * The warp walks the units of the CTA's share of the static schedule (in the split launch the work of the
@@ -375,5 +414,9 @@ class EpilogueRole:
                 for c in cutlass.range(lane, rows * 16, self.threads_per_warp, unroll=1):
                     dst = base + Int64(c >> 4) * row_bytes + Int64((c & 15) * 16)
                     store_vector(gptr(Int32, dst, 16), (z, z, z, z))
+                if cutlass.const_expr(self.lse):
+                    lse_row0 = lse_addr + Int64((b * heads + h) * seqlen + row0) * 4
+                    for r in cutlass.range(lane, rows, self.threads_per_warp, unroll=1):
+                        cute.arch.store(gptr(Float32, lse_row0 + Int64(r) * 4), -Float32.inf)
             sched.advance_to_next_work()
             work = sched.get_current_work()

@@ -60,6 +60,7 @@ def attn_launch(
     o_ptr: cute.Pointer,
     part_ptr: cute.Pointer,
     flags_ptr: cute.Pointer,
+    lse_ptr: Int64,
     lens_ptr,
     S: Int32,
     H: Int32,
@@ -69,6 +70,7 @@ def attn_launch(
     parts: Int32,
     stream: cuda.CUstream,
 ):
+    # lse_ptr: the address of the FP32 [B, H, S] log-sum-exp output, or 0
     nT = (S + KT - 1) // KT
     batch = Int64(S) * H * 128
     # K' as (32 bytes, keys, K_STEPS atom columns) of [S, 128 bytes, H, B]: one box per tile of K_STEPS x 128 keys x
@@ -124,6 +126,7 @@ def attn_launch(
         score_scale_ptr,
         vs_ptr,
         o_ptr,
+        lse_ptr,
         part_ptr,
         flags_ptr,
         tma_atom_k,
@@ -152,6 +155,7 @@ def merge_launch(
     part_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
     vs_ptr: cute.Pointer,
+    lse_ptr: Int64,
     lens_ptr,
     S: Int32,
     H: Int32,
@@ -160,7 +164,7 @@ def merge_launch(
     parts: Int32,
     stream: cuda.CUstream,
 ):
-    merge_partial_kernel(part_ptr, o_ptr, vs_ptr, S, H, parts, n_full, lens_ptr).launch(
+    merge_partial_kernel(part_ptr, o_ptr, vs_ptr, lse_ptr, S, H, parts, n_full, lens_ptr).launch(
         grid=[n_tail, 1, 1], block=[NTHR, 1, 1], smem=QT * EP, stream=stream
     )
 
@@ -176,11 +180,15 @@ _compiled = {}
 
 
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
     """Write BF16 o [B, S, H, 128] = (P V' + S M) * v8_scale / l from the buffers of the call, on the current stream.
     Nothing here reads a device value or allocates. lens: None, or the int32 valid prefix lengths [B] of the
-    preparation, read in place by the kernel variants with lengths; the launch plan follows the padded sequence."""
+    preparation, read in place by the kernel variants with lengths; the launch plan follows the padded sequence.
+    lse: None, or FP32 [B, H, S] for the log-sum-exp of every query row."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -197,12 +205,13 @@ def run(
         (cutlass.BFloat16, o),
     )
     lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
+    lse_addr = Int64(lse.data_ptr() if lse is not None else 0)
     ptrs = [gmem_ptr(dt, x, 16) for dt, x in ops]
 
     def launch(fn: Callable, ptrs: list, sizes: tuple[int, ...]) -> None:
         key = (dev.index, fn, lens is not None)
-        args = (*ptrs, lens_ptr, *(Int32(n) for n in sizes), stream)
-        compiled(_compiled, key, lambda: fn, *args)(*ptrs, lens_ptr, *sizes, stream)
+        args = (*ptrs, lse_addr, lens_ptr, *(Int32(n) for n in sizes), stream)
+        compiled(_compiled, key, lambda: fn, *args)(*ptrs, lse_addr, lens_ptr, *sizes, stream)
 
     nT = (S + KT - 1) // KT
     plan = split_plan(nT * H * B, nT, num_sms(dev))

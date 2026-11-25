@@ -105,8 +105,14 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         split: bool = False,
         pdl: bool = True,
         lens: bool = False,
+        lse: bool = False,
     ):
         self.sm_count = sm_count
+        # lse: the launch writes the log-sum-exp of every query row (epilogue.py); the softmax warpgroups then
+        # publish the final anchor of a work tile to the epilogue warpgroup, as they do for the pieces of a split
+        # launch
+        self.lse = lse
+        self.anchor_exchange = split or lse
         # lens: the launch takes per-sample valid prefix lengths: a batch element of n valid tokens attends its first
         # n keys, and its query rows from n on are zero in O. The roles run the live units (sched.py) over the KV
         # tiles that hold a valid key; the idle warp stores the rows of the other units
@@ -224,10 +230,11 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             # softmax warpgroup j -> MMA warp: the last quarter of P_j is stored
             p_tail_mbar_ptr=MemRange[Int64, 2],
         )
-        if self.split:
-            # softmax -> epilogue exchange of the split launch (row, 2 values, stage, warpgroup): the final anchor
-            # of a KV piece in value 0
+        if self.anchor_exchange:
+            # softmax -> epilogue exchange (row, 2 values, stage, warpgroup): the final anchor of a work tile or KV
+            # piece in value 0, which the epilogue's row sums and the LSE refer to
             fields["sVec"] = Align[MemRange[Float32, 128 * 2 * 2 * 2], 16]
+        if self.split:
             # per O tile: whether this piece arrived last at the tile's counter and merges it (epilogue.py)
             fields["split_last"] = MemRange[Int32, 2]
         fields.update(
@@ -258,6 +265,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         b: Int32,
         score_scale_addr: Int64,
         v_scale_addr: Int64,
+        lse_addr: Int64,
         n_full: Int32,
         n_parts: Int32,
         split_o_addr: Int64,
@@ -472,6 +480,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             tma_tensor_o,
             score_scale_addr,
             v_scale_addr,
+            lse_addr,
             q_smem_layout_staged,
             k_smem_layout_staged,
             qk_sf_smem_layouts,
@@ -621,8 +630,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         sV = cute.make_tensor(sV_ptr, v_layout.outer)
         sO = storage.sO.get_tensor(o_layout.outer, swizzle=o_layout.inner)
         sVec = None
-        if cutlass.const_expr(self.split):
-            # the anchor exchange of the split launch: (row, 2 values, stage, warpgroup)
+        if cutlass.const_expr(self.anchor_exchange):
+            # the anchor exchange: (row, 2 values, stage, warpgroup)
             sVec = storage.sVec.get_tensor(
                 cute.make_layout((128, 2, 2, 2), stride=(2, 1, 256, 512))
             )
@@ -668,6 +677,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         mO_qdl: cute.Tensor,
         score_scale_addr: Int64,
         v_scale_addr: Int64,
+        lse_addr: Int64,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         qk_sf_smem_layouts: Tuple,
@@ -787,6 +797,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             tma_tensor_vm=tma_tensor_vm,
             score_scale_addr=score_scale_addr,
             v_scale_addr=v_scale_addr,
+            lse_addr=lse_addr,
             split_args=split_scratch,
             # the CTA in its cluster
             cta_coord_vmnk=cta_coord_vmnk,
@@ -819,6 +830,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             tile_sched=tile_sched,
             work_tile=work_tile,
             seqlen_k=seqlen_k,
+            heads=tile_sched_params.problem_shape_mhb[1],
             n_kv_tiles=n_kv_tiles,
         )
 
@@ -829,7 +841,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             cute.arch.setmaxregister_decrease(self.num_regs_other)
         if warp_idx == self.idle_warp_id:
             if cutlass.const_expr(self.lens):
-                self.zero_rows(tile_sched_params, lens_addr, o_addr, seqlen_k, tidx)
+                self.zero_rows(tile_sched_params, lens_addr, o_addr, lse_addr, seqlen_k, tidx)
         if warp_idx == self.load_warp_id:
             self._run_load_warp(st)
         if warp_idx == self.mma_warp_id:
@@ -986,7 +998,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             wg=wg,
             tensor_args=(
                 tStS,
-                st.sVec[None, None, None, wg] if self.split else None,
+                st.sVec[None, None, None, wg] if self.anchor_exchange else None,
                 tOtOi,
                 st.pv_thr_mma,
                 # the warpgroup's own P-empty barrier (committed after each PV_j)
@@ -1008,7 +1020,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         tOtO0 = cute.make_tensor(tmem_ptr + self.tmem_o0_offset, st.o_tmem_layout)
         tOtO1 = cute.make_tensor(tmem_ptr + self.tmem_o1_offset, st.o_tmem_layout)
         vec0 = vec1 = None
-        if cutlass.const_expr(self.split):
+        if cutlass.const_expr(self.anchor_exchange):
             # this thread's rows of the anchor exchange of softmax warpgroups 0 and 1
             thread_idx = st.tidx % (self.threads_per_wg)
             vec0 = st.sVec[thread_idx, None, None, 0]
@@ -1021,6 +1033,10 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             tOtO1=tOtO1,
             vec0=vec0,
             vec1=vec1,
+            # the LSE output (a null address without one), its row index base: (batch * H + head) * S
+            lse_addr=st.lse_addr,
+            seqlen=st.seqlen_k,
+            heads=st.heads,
         )
 
     @cute.jit
@@ -1032,6 +1048,17 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         live_rows = None
         if cutlass.const_expr(self.lens):
             live_rows = self.valid_keys(work_tile) - work_tile.tile_idx[0] * self.cta_tiler[0]
+        # the LSE rows of the work tile: its first query row and the (batch, head) row block of the output
+        lse_args = None
+        if cutlass.const_expr(self.lse):
+            h, b = work_tile.tile_idx[2]
+            lse_args = (
+                epi.lse_addr,
+                epi.score_scale,
+                work_tile.tile_idx[0] * self.cta_tiler[0],
+                (b * epi.heads + h) * epi.seqlen,
+                epi.seqlen,
+            )
         if cutlass.const_expr(self.split):
             # both O tiles in one pass: publish first, then merge (the two merges run on different SMs)
             s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = (
@@ -1048,6 +1075,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                     tuple(work_tile.tile_idx[i] for i in (PART, NPARTS, SLOT_BASE)),
                     st.split_args,
                     epi.score_scale,
+                    lse_args,
                     live_rows,
                 )
             )
@@ -1055,18 +1083,20 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             # one O tile at a time (the softmax warpgroups rescale O themselves)
             s0_epi_consumer, mma_epi_consumer, epi_store_producer = self.epilogue_tile(
                 st.pv_thr_mma,
-                (epi.tOtO0, st.sO[None, None, 0]),
+                (epi.tOtO0, st.sO[None, None, 0], epi.vec0),
                 (s0_epi_consumer, mma_epi_consumer, epi_store_producer),
                 epi.scale_output,
                 0,
+                lse_args,
                 live_rows,
             )
             s1_epi_consumer, mma_epi_consumer, epi_store_producer = self.epilogue_tile(
                 st.pv_thr_mma,
-                (epi.tOtO1, st.sO[None, None, 1]),
+                (epi.tOtO1, st.sO[None, None, 1], epi.vec1),
                 (s1_epi_consumer, mma_epi_consumer, epi_store_producer),
                 epi.scale_output,
                 1,
+                lse_args,
                 live_rows,
             )
         return s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer

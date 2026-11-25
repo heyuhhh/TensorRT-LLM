@@ -49,6 +49,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 
 from ._worker_pool import run_distributed
+from .test_attn2d_attention import _logic_ring_deco_vs_standard
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -452,6 +453,15 @@ class TestRingAttentionFlashAttn4:
 
     def test_ring_fa4_vs_standard(self):
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_fa4_vs_standard, use_cuda=True)
+
+
+class TestRingAttentionDeCo:
+    """Ring with DeCo-Attention inner: the ring steps merge on the LSE of the kernels (the case is
+    shared with the Attention2D tests)."""
+
+    def test_ring_deco_vs_standard(self, require_deco_kernels):
+        require_deco_kernels()
+        run_test_in_distributed(world_size=2, test_fn=_logic_ring_deco_vs_standard, use_cuda=True)
 
 
 class TestRingUlyssesAttention:

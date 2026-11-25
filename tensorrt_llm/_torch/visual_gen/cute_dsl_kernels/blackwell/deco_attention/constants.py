@@ -54,6 +54,7 @@ QK_SCALE_ATOMS = qk_scale_atoms(DEFAULT_RANK)
 # tile exceeds it by more than T binades
 RESCALE_THRESHOLD = 4.0
 E4M3_MAX = 448.0  # the largest finite E4M3 value
+LN2 = 0.6931471805599453  # ln 2: the kernels keep scores in log2 units, the LSE output is in natural units
 E2M1_MAX = 6.0  # the largest E2M1 value
 # the V scale is a power of two at or above the largest deviation from the block means over the code range; the block
 # means are stored divided by that scale too, so the deviation maximum also takes |mean| times this factor, which

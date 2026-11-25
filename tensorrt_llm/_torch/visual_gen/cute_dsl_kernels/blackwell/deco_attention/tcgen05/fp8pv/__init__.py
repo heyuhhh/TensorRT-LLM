@@ -78,7 +78,12 @@ def prepare(
 
 
 def attention(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    rank: int,
+    lens: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> None:
-    """Run the attention of this kernel into BF16 o on the buffers that prepare filled; lens: those prepare took."""
-    launch.run(buffers, o, rank, lens)
+    """Run the attention of this kernel into BF16 o on the buffers that prepare filled; lens: those prepare took;
+    lse: None, or the FP32 [B, H, S] log-sum-exp output."""
+    launch.run(buffers, o, rank, lens, lse)

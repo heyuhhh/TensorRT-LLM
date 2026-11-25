@@ -34,12 +34,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention, RingAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd as _fa4_fwd,
 )
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ._worker_pool import run_distributed
 
@@ -263,6 +265,68 @@ def _logic_attn2d_vs_standard(rank, world_size):
         atol=1e-3,
         msg=f"Rank {rank}: Attention2D output differs from standard attention",
     )
+
+
+def _logic_cp_deco_vs_standard_impl(rank, world_size, ring):
+    """DeCo-Attention inside RingAttention (ring) or Attention2DAttention (a 1 x world_size mesh):
+    every shard matches full-sequence SDPA through the LSE the kernels return."""
+    batch, num_heads, head_dim = 1, 4, 128
+    seq_per_rank = 8192  # the fewest rows the DeCo kernels take per call
+    seq_full = seq_per_rank * world_size
+    device = torch.device(f"cuda:{rank}")
+    row_pg, col_pg = _make_process_groups(rank, world_size, 1, world_size)
+
+    inner = DeCoAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
+        ),
+    )
+    if ring:
+        attn = RingAttention(inner, col_pg)
+    else:
+        try:
+            attn = Attention2DAttention(inner, row_pg, col_pg)
+        except ImportError:
+            pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+    lo, hi = rank * seq_per_rank, (rank + 1) * seq_per_rank
+    output = attn(
+        q_full[:, lo:hi].contiguous(),
+        k_full[:, lo:hi].contiguous(),
+        v_full[:, lo:hi].contiguous(),
+        batch_size=batch,
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    q_std = q_full.transpose(1, 2).float()  # [B, H, S, D]
+    k_std = k_full.transpose(1, 2).float()
+    v_std = v_full.transpose(1, 2).float()
+    std_output = F.scaled_dot_product_attention(q_std, k_std, v_std, scale=scale)
+    expected = std_output.transpose(1, 2)[:, lo:hi]  # [B, S, H, D]
+    # The kernels quantize Q, K and V: the shard's relative L2 error against SDPA stays within a
+    # tenth of that of one kernel call over the whole sequence.
+    one_call = inner(q_full, k_full, v_full)[:, lo:hi]
+    assert not inner._noted_unquantized, "a call ran on VANILLA instead of the kernels"
+    error = (output.float() - expected).norm() / expected.norm()
+    error_one_call = (one_call.float() - expected).norm() / expected.norm()
+    assert error < 1.1 * error_one_call, (
+        f"Rank {rank}: error {error:.4f} vs SDPA, one kernel call {error_one_call:.4f}"
+    )
+
+
+def _logic_attn2d_deco_vs_standard(rank, world_size):
+    _logic_cp_deco_vs_standard_impl(rank, world_size, ring=False)
+
+
+def _logic_ring_deco_vs_standard(rank, world_size):
+    _logic_cp_deco_vs_standard_impl(rank, world_size, ring=True)
 
 
 def _logic_attn2d_replicated_kv_unequal_lengths_impl(
@@ -670,6 +734,11 @@ class TestAttn2DAttention:
     def test_attn2d_invalid_mask_raises(self):
         """CAUSAL mask raises ValueError (only FULL is supported)."""
         run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_invalid_mask, use_cuda=True)
+
+    def test_attn2d_deco_vs_standard_attention(self, require_deco_kernels):
+        """A 1x2 mesh with DeCo-Attention inner matches full-sequence SDPA on its LSE."""
+        require_deco_kernels()
+        run_test_in_distributed(world_size=2, test_fn=_logic_attn2d_deco_vs_standard, use_cuda=True)
 
 
 class TestAttn2DAttentionMeshVariants:
